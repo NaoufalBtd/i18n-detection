@@ -151,12 +151,20 @@ function loadBaseline(filePath: string): { ids: Set<string>; fingerprints: Set<s
   return { ids, fingerprints };
 }
 
-function reportCatalogPlan(plan: ReturnType<Extractor['planCatalog']>): void {
-  console.log(`Catalog: ${path.relative(process.cwd(), plan.catalogPath) || plan.catalogPath}`);
+function reportCatalogPlan(plan: ReturnType<Extractor['planCatalogs']>[number]): void {
+  const route = plan.namespace ? ` (namespace ${plan.namespace}${plan.stripNamespace ? ', stripped' : ''})` : '';
+  console.log(`Catalog: ${path.relative(process.cwd(), plan.catalogPath) || plan.catalogPath}${route}`);
   console.log(`New entries: ${plan.report.newEntries.length}`);
   console.log(`Existing/reused entries: ${plan.report.existingMatches.length + plan.report.similarValues.length}`);
   console.log(`Key collisions: ${plan.report.keyCollisions.length}`);
   console.log(`Blocked findings: ${plan.report.blockedFindings.length}`);
+}
+
+function reportCatalogPlans(plans: ReturnType<Extractor['planCatalogs']>): void {
+  for (const [index, plan] of plans.entries()) {
+    if (index > 0) console.log('');
+    reportCatalogPlan(plan);
+  }
 }
 
 const program = new Command();
@@ -234,7 +242,7 @@ program
 
 program
   .command('extract')
-  .description('Plan or merge source strings into a locale catalog')
+  .description('Plan or merge source strings into routed locale catalogs')
   .option('--locale <locale>', 'Catalog locale; defaults to configured source locale')
   .option('--merge', 'Write safe new entries to the catalog')
   .option('--dry-run', 'Never modify files')
@@ -252,29 +260,32 @@ program
 
     const report = scanner.scanFiles(targetFiles);
     const extractor = new Extractor(config);
-    const plan = extractor.planCatalog(report.findings, locale);
-    reportCatalogPlan(plan);
+    const plans = extractor.planCatalogs(report.findings, locale);
+    reportCatalogPlans(plans);
 
-    for (const collision of plan.report.keyCollisions) {
-      console.error(`Collision ${collision.key}: '${collision.oldValue}' vs '${collision.newValue}' (${collision.filePath})`);
-    }
-    for (const blocked of plan.report.blockedFindings) {
-      console.warn(`Review required ${blocked.filePath}: ${blocked.reason}`);
+    for (const plan of plans) {
+      for (const collision of plan.report.keyCollisions) {
+        console.error(`Collision ${collision.key}: '${collision.oldValue}' vs '${collision.newValue}' (${collision.filePath})`);
+      }
+      for (const blocked of plan.report.blockedFindings) {
+        console.warn(`Review required ${blocked.filePath}: ${blocked.reason}`);
+      }
     }
 
-    if (plan.report.keyCollisions.length > 0) {
+    if (plans.some(plan => plan.report.keyCollisions.length > 0)) {
       process.exitCode = 1;
       return;
     }
     if (options.merge && !options.dryRun) {
-      extractor.writePlan(plan);
-      console.log(plan.changed ? 'Catalog updated atomically.' : 'Catalog already up to date.');
+      extractor.writePlans(plans);
+      const changed = plans.filter(plan => plan.changed).length;
+      console.log(changed > 0 ? `Updated ${changed} catalog(s) atomically.` : 'Catalogs already up to date.');
     }
   });
 
 program
   .command('apply')
-  .description('Plan or atomically apply safe next-intl codemods together with source-locale catalog updates')
+  .description('Plan or atomically apply safe next-intl codemods together with routed source-locale catalog updates')
   .option('--write', 'Write source and catalog changes atomically; default is dry-run')
   .option('--dry-run', 'Force dry-run')
   .option('--confidence <level>', 'Minimum confidence level', 'high')
@@ -306,20 +317,28 @@ program
     }
 
     const extractor = new Extractor(config);
-    const catalogPlan = extractor.planCatalog(selected, config.i18n.sourceLocale);
-    reportCatalogPlan(catalogPlan);
-    if (catalogPlan.report.keyCollisions.length > 0 || catalogPlan.report.blockedFindings.length > 0) {
-      console.error('Refusing to plan source changes because the catalog plan is not deterministic.');
+    const catalogPlans = extractor.planCatalogs(selected, config.i18n.sourceLocale);
+    reportCatalogPlans(catalogPlans);
+    if (
+      catalogPlans.some(
+        plan => plan.report.keyCollisions.length > 0 || plan.report.blockedFindings.length > 0
+      )
+    ) {
+      console.error('Refusing to plan source changes because at least one catalog plan is not deterministic.');
       process.exitCode = 1;
       return;
     }
 
+    const keyOverrides = Object.assign(
+      {},
+      ...catalogPlans.map(plan => plan.keyByFindingId)
+    ) as Record<string, string>;
     const codemod = new CodemodEngine(config);
     const results = codemod.planCodemods(report.findings, targetFiles, {
       dryRun: true,
       confidence: minimum,
       findingId: options.findingId,
-      keyOverrides: catalogPlan.keyByFindingId
+      keyOverrides
     });
 
     for (const result of results) {
@@ -350,7 +369,11 @@ program
     const writes = results
       .filter(result => result.modified && result.plannedContent !== undefined)
       .map(result => ({ filePath: path.resolve(process.cwd(), result.filePath), content: result.plannedContent! }));
-    if (catalogPlan.changed) writes.push({ filePath: catalogPlan.catalogPath, content: catalogPlan.outputContent });
+    writes.push(
+      ...catalogPlans
+        .filter(plan => plan.changed)
+        .map(plan => ({ filePath: plan.catalogPath, content: plan.outputContent }))
+    );
     writeFilesAtomically(writes);
     console.log(`Atomically updated ${writes.length} file(s).`);
   });
