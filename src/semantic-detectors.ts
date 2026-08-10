@@ -362,8 +362,11 @@ function detectStateMessages(
 
     const elements = nameNode.getElements();
     if (elements.length < 2) continue;
-    const stateName = elements[0]?.getNameNode().getText();
-    const setterName = elements[1]?.getNameNode().getText();
+    const stateElement = elements[0];
+    const setterElement = elements[1];
+    if (!stateElement || !setterElement || !Node.isBindingElement(stateElement) || !Node.isBindingElement(setterElement)) continue;
+    const stateName = stateElement.getNameNode().getText();
+    const setterName = setterElement.getNameNode().getText();
     if (!stateName || !setterName) continue;
 
     const rendered = sourceFile
