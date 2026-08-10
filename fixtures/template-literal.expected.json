@@ -1,0 +1,76 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "2026-06-14T00:00:00.000Z",
+  "projectRoot": "/repo",
+  "summary": {
+    "filesScanned": 1,
+    "filesWithFindings": 1,
+    "totalFindings": 2,
+    "highConfidence": 1,
+    "mediumConfidence": 1,
+    "lowConfidence": 0,
+    "autoFixCandidates": 1,
+    "needsReview": 1
+  },
+  "suppressions": {
+    "total": 0,
+    "withoutReason": 0
+  },
+  "findings": [
+    {
+      "id": "fixtures/template-literal.input.tsx:3:15:jsxtext",
+      "filePath": "fixtures/template-literal.input.tsx",
+      "line": 3,
+      "column": 15,
+      "endLine": 3,
+      "endColumn": 20,
+      "rawText": "Empty",
+      "normalizedText": "Empty",
+      "kind": "JSXText",
+      "confidence": "high",
+      "reason": "Direct JSX text inside div",
+      "userFacingContext": {
+        "type": "JSXText",
+        "elementName": "div"
+      },
+      "suggestedKey": "template-literal.input.page.empty",
+      "suggestedReplacement": "{t(\"template-literal.input.page.empty\")}",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:empty",
+      "autoFixCandidate": true,
+      "needsReview": false,
+      "tags": [
+        "jsxtext",
+        "high"
+      ]
+    },
+    {
+      "id": "fixtures/template-literal.input.tsx:2:17:templateliteral",
+      "filePath": "fixtures/template-literal.input.tsx",
+      "line": 2,
+      "column": 17,
+      "endLine": 2,
+      "endColumn": 44,
+      "rawText": "`Deleted ${count} projects`",
+      "normalizedText": "`Deleted ${count} projects`",
+      "kind": "TemplateLiteralUsedInUserFacingContext",
+      "confidence": "medium",
+      "reason": "Template literal may require interpolation and pluralization",
+      "userFacingContext": {
+        "type": "CallExpression",
+        "functionName": "toast.success",
+        "argumentIndex": 0
+      },
+      "suggestedKey": "template-literal.input.page.deletedCountPr",
+      "suggestedReplacement": "t(\"template-literal.input.page.deletedCountPr\")",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:-deleted-count-projects-",
+      "autoFixCandidate": false,
+      "needsReview": true,
+      "tags": [
+        "callexpression",
+        "medium"
+      ]
+    }
+  ]
+}

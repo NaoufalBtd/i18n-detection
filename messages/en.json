@@ -1,0 +1,13 @@
+{
+  "settings": {
+    "settingspage": {
+      "manageYourLoginDe": "Manage your login details and account preferences here.",
+      "placeholder": "Enter new username",
+      "ariaLabel": "Username input",
+      "profileSavedSucces": "Profile saved successfully"
+    },
+    "button": {
+      "label": "Save Changes"
+    }
+  }
+}

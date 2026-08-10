@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "2026-06-14T00:00:00.000Z",
+  "projectRoot": "/repo",
+  "summary": {
+    "filesScanned": 1,
+    "filesWithFindings": 1,
+    "totalFindings": 1,
+    "highConfidence": 1,
+    "mediumConfidence": 0,
+    "lowConfidence": 0,
+    "autoFixCandidates": 1,
+    "needsReview": 0
+  },
+  "suppressions": {
+    "total": 0,
+    "withoutReason": 0
+  },
+  "findings": [
+    {
+      "id": "fixtures/local-constant.input.tsx:4:29:localconst",
+      "filePath": "fixtures/local-constant.input.tsx",
+      "line": 4,
+      "column": 29,
+      "endLine": 4,
+      "endColumn": 34,
+      "rawText": "Account settings",
+      "normalizedText": "Account settings",
+      "kind": "LocalConstUsedInUserFacingContext",
+      "confidence": "high",
+      "reason": "Known component prop 'title' of PageHeader",
+      "userFacingContext": {
+        "type": "JSXAttribute",
+        "elementName": "PageHeader",
+        "propName": "title"
+      },
+      "suggestedKey": "local-constant.input.pageheader.title",
+      "suggestedReplacement": "{t(\"local-constant.input.pageheader.title\")}",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:account-settings",
+      "autoFixCandidate": true,
+      "needsReview": false,
+      "tags": [
+        "jsxattribute",
+        "high"
+      ],
+      "declarationLocation": {
+        "file": "fixtures/local-constant.input.tsx",
+        "line": 1,
+        "column": 7
+      },
+      "usageLocation": {
+        "file": "fixtures/local-constant.input.tsx",
+        "line": 4,
+        "column": 29
+      },
+      "variableName": "title"
+    }
+  ]
+}

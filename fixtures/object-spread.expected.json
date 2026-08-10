@@ -1,0 +1,77 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "2026-06-14T00:00:00.000Z",
+  "projectRoot": "/repo",
+  "summary": {
+    "filesScanned": 1,
+    "filesWithFindings": 1,
+    "totalFindings": 2,
+    "highConfidence": 2,
+    "mediumConfidence": 0,
+    "lowConfidence": 0,
+    "autoFixCandidates": 2,
+    "needsReview": 0
+  },
+  "suppressions": {
+    "total": 0,
+    "withoutReason": 0
+  },
+  "findings": [
+    {
+      "id": "fixtures/object-spread.input.tsx:2:10:localobjectproperty",
+      "filePath": "fixtures/object-spread.input.tsx",
+      "line": 2,
+      "column": 10,
+      "endLine": 2,
+      "endColumn": 29,
+      "rawText": "No projects found",
+      "normalizedText": "No projects found",
+      "kind": "LocalObjectPropertyUsedInUserFacingContext",
+      "confidence": "high",
+      "reason": "Object property 'title' spread into known component EmptyState",
+      "userFacingContext": {
+        "type": "JSXAttribute",
+        "elementName": "EmptyState",
+        "propName": "title"
+      },
+      "suggestedKey": "object-spread.input.emptystate.title",
+      "suggestedReplacement": "{t(\"object-spread.input.emptystate.title\")}",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:no-projects-found",
+      "autoFixCandidate": true,
+      "needsReview": false,
+      "tags": [
+        "jsxattribute",
+        "high"
+      ]
+    },
+    {
+      "id": "fixtures/object-spread.input.tsx:3:16:localobjectproperty",
+      "filePath": "fixtures/object-spread.input.tsx",
+      "line": 3,
+      "column": 16,
+      "endLine": 3,
+      "endColumn": 43,
+      "rawText": "Create your first project",
+      "normalizedText": "Create your first project",
+      "kind": "LocalObjectPropertyUsedInUserFacingContext",
+      "confidence": "high",
+      "reason": "Object property 'description' spread into known component EmptyState",
+      "userFacingContext": {
+        "type": "JSXAttribute",
+        "elementName": "EmptyState",
+        "propName": "description"
+      },
+      "suggestedKey": "object-spread.input.emptystate.description",
+      "suggestedReplacement": "{t(\"object-spread.input.emptystate.description\")}",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:create-your-first-project",
+      "autoFixCandidate": true,
+      "needsReview": false,
+      "tags": [
+        "jsxattribute",
+        "high"
+      ]
+    }
+  ]
+}

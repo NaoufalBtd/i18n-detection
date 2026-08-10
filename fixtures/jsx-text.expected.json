@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "2026-06-14T00:00:00.000Z",
+  "projectRoot": "/repo",
+  "summary": {
+    "filesScanned": 1,
+    "filesWithFindings": 1,
+    "totalFindings": 2,
+    "highConfidence": 2,
+    "mediumConfidence": 0,
+    "lowConfidence": 0,
+    "autoFixCandidates": 2,
+    "needsReview": 0
+  },
+  "suppressions": {
+    "total": 0,
+    "withoutReason": 0
+  },
+  "findings": [
+    {
+      "id": "fixtures/jsx-text.input.tsx:4:11:jsxtext",
+      "filePath": "fixtures/jsx-text.input.tsx",
+      "line": 4,
+      "column": 11,
+      "endLine": 4,
+      "endColumn": 27,
+      "rawText": "Account settings",
+      "normalizedText": "Account settings",
+      "kind": "JSXText",
+      "confidence": "high",
+      "reason": "Direct JSX text inside h1",
+      "userFacingContext": {
+        "type": "JSXText",
+        "elementName": "h1"
+      },
+      "suggestedKey": "jsx-text.input.page.accountSettings",
+      "suggestedReplacement": "{t(\"jsx-text.input.page.accountSettings\")}",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:account-settings",
+      "autoFixCandidate": true,
+      "needsReview": false,
+      "tags": [
+        "jsxtext",
+        "high"
+      ]
+    },
+    {
+      "id": "fixtures/jsx-text.input.tsx:5:10:jsxtext",
+      "filePath": "fixtures/jsx-text.input.tsx",
+      "line": 5,
+      "column": 10,
+      "endLine": 5,
+      "endColumn": 29,
+      "rawText": "Manage your profile",
+      "normalizedText": "Manage your profile",
+      "kind": "JSXText",
+      "confidence": "high",
+      "reason": "Direct JSX text inside p",
+      "userFacingContext": {
+        "type": "JSXText",
+        "elementName": "p"
+      },
+      "suggestedKey": "jsx-text.input.page.manageYourProfile",
+      "suggestedReplacement": "{t(\"jsx-text.input.page.manageYourProfile\")}",
+      "existingSimilarKey": null,
+      "duplicateGroupId": "text:manage-your-profile",
+      "autoFixCandidate": true,
+      "needsReview": false,
+      "tags": [
+        "jsxtext",
+        "high"
+      ]
+    }
+  ]
+}
