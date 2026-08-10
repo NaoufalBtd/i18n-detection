@@ -173,6 +173,24 @@ function getContainingComponentName(node: Node): string | undefined {
   return undefined;
 }
 
+function isFunctionScope(node: Node): boolean {
+  return (
+    Node.isFunctionDeclaration(node) ||
+    Node.isArrowFunction(node) ||
+    Node.isFunctionExpression(node) ||
+    Node.isMethodDeclaration(node)
+  );
+}
+
+function nearestFunctionScope(node: Node): Node | undefined {
+  let current = node.getParent();
+  while (current) {
+    if (isFunctionScope(current)) return current;
+    current = current.getParent();
+  }
+  return undefined;
+}
+
 function expressionPlaceholder(expression: Node, index: number, used: Set<string>): string {
   let base = `value${index}`;
   if (Node.isIdentifier(expression)) base = expression.getText();
@@ -262,6 +280,35 @@ export class Scanner {
     const parsed = path.parse(normalized);
     if (parsed.name && parsed.name !== 'index' && parsed.name !== 'page') return camelCase(parsed.name) || 'common';
     return 'common';
+  }
+
+  private inferBoundTranslationNamespace(node: Node): string | undefined {
+    const scopes: Node[] = [];
+    let current = node.getParent();
+    while (current) {
+      if (isFunctionScope(current)) scopes.push(current);
+      current = current.getParent();
+    }
+    scopes.push(node.getSourceFile());
+
+    for (const scope of scopes) {
+      const namespaces = new Set<string>();
+      for (const call of scope.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        const owner = nearestFunctionScope(call);
+        if (Node.isSourceFile(scope)) {
+          if (owner) continue;
+        } else if (owner !== scope) {
+          continue;
+        }
+        const callee = call.getExpression().getText().replace(/\s+/g, '');
+        if (callee !== this.config.i18n.clientHook && callee !== this.config.i18n.serverAsyncFunction) continue;
+        const firstArg = call.getArguments()[0];
+        if (firstArg && Node.isStringLiteral(firstArg)) namespaces.add(firstArg.getLiteralValue());
+      }
+      if (namespaces.size === 1) return [...namespaces][0];
+      if (namespaces.size > 1) return undefined;
+    }
+    return undefined;
   }
 
   private generateSuggestedKey(text: string, namespace: string, contextName?: string, propOrKey?: string): string {
@@ -451,7 +498,7 @@ export class Scanner {
       reason = `${reason}; conditional source copy requires review`;
     }
 
-    const namespace = this.inferNamespace(relativeFilePath);
+    const namespace = this.inferBoundTranslationNamespace(node) ?? this.inferNamespace(relativeFilePath);
     const containingComponent = getContainingComponentName(node);
     let contextName = 'general';
     if (context.type === 'JSXAttribute' && context.elementName && /^[A-Z]/.test(context.elementName)) {
