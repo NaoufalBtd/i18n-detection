@@ -12,6 +12,7 @@ import {
   ts
 } from 'ts-morph';
 import { CacheManager, hashContent } from './cache.js';
+import { detectSemanticCandidates } from './semantic-detectors.js';
 import { REPORT_SCHEMA_VERSION } from './version.js';
 import type {
   ScannerConfig,
@@ -437,7 +438,9 @@ export class Scanner {
     if (traced.type === 'template_literal') {
       finalKind = 'TemplateLiteralUsedInUserFacingContext';
       finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
-      reason = 'Template literal requires interpolation/pluralization review';
+      reason = context.type === 'TranslatedLiteralFragment'
+        ? 'Template literal mixes translated output with hardcoded literal fragments'
+        : 'Template literal requires interpolation/pluralization review';
     } else if (traced.type === 'concatenation') {
       finalKind = 'StringConcatenationUsedInUserFacingContext';
       finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
@@ -445,7 +448,7 @@ export class Scanner {
     } else if (traced.type === 'conditional') {
       finalKind = 'ConditionalStringUsedInUserFacingContext';
       finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
-      reason = 'Conditional expression contains multiple hardcoded strings';
+      reason = `${reason}; conditional source copy requires review`;
     }
 
     const namespace = this.inferNamespace(relativeFilePath);
@@ -727,6 +730,28 @@ export class Scanner {
             }
           }
         }
+      }
+
+      for (const candidate of detectSemanticCandidates(sourceFile, relativePath, this.config)) {
+        const resolved = this.resolveExpression(candidate.node);
+        if (resolved.type === 'unknown' || resolved.type === 'object') continue;
+        const finding = this.buildFinding(
+          candidate.node,
+          resolved,
+          candidate.kind,
+          candidate.confidence,
+          candidate.reason,
+          candidate.context,
+          relativePath,
+          fileSuppressions
+        );
+        if (!finding) continue;
+        const duplicate = findings.slice(startIndex).some(existing =>
+          existing.line === finding.line &&
+          existing.column === finding.column &&
+          (existing.normalizedText ?? existing.rawText) === (finding.normalizedText ?? finding.rawText)
+        );
+        if (!duplicate) findings.push(finding);
       }
 
       if (this.config.scanErrors !== false) {
