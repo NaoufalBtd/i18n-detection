@@ -28,13 +28,64 @@ describe('configuration', () => {
     });
   });
 
-  it('deep-merges i18n and feature settings', () => {
-    withTempFile(JSON.stringify({ i18n: { sourceLocale: 'fr' }, features: { codemod: true } }), filePath => {
-      const config = loadConfig(filePath);
-      expect(config.i18n.sourceLocale).toBe('fr');
-      expect(config.i18n.library).toBe('next-intl');
-      expect(config.features.codemod).toBe(true);
-      expect(config.features.templateLiterals).toBe(true);
-    });
+  it('deep-merges i18n, semantic, and feature settings', () => {
+    withTempFile(
+      JSON.stringify({
+        i18n: { sourceLocale: 'fr' },
+        semantic: { scanNextMetadata: false },
+        features: { codemod: true }
+      }),
+      filePath => {
+        const config = loadConfig(filePath);
+        expect(config.i18n.sourceLocale).toBe('fr');
+        expect(config.i18n.library).toBe('next-intl');
+        expect(config.semantic?.scanNextMetadata).toBe(false);
+        expect(config.semantic?.scanValidationMessages).toBe(true);
+        expect(config.features.codemod).toBe(true);
+        expect(config.features.templateLiterals).toBe(true);
+      }
+    );
+  });
+
+  it('accepts deterministic split catalog routes', () => {
+    withTempFile(
+      JSON.stringify({
+        i18n: {
+          catalogRoutes: [
+            {
+              namespace: 'products',
+              messagesPath: 'apps/web/src/locales/{locale}/storefront/products.json',
+              stripNamespace: true
+            },
+            {
+              namespace: 'admin.categoryManagement',
+              messagesPath: 'apps/web/src/locales/{locale}/admin/categoryManagement.json',
+              stripNamespace: true
+            }
+          ]
+        }
+      }),
+      filePath => {
+        const config = loadConfig(filePath);
+        expect(config.i18n.catalogRoutes).toHaveLength(2);
+        expect(config.i18n.catalogRoutes?.[0].namespace).toBe('products');
+      }
+    );
+  });
+
+  it('rejects duplicate or malformed catalog routes', () => {
+    withTempFile(
+      JSON.stringify({
+        i18n: {
+          catalogRoutes: [
+            { namespace: 'products', messagesPath: 'one/{locale}.json' },
+            { namespace: 'products', messagesPath: 'two/{locale}.json' }
+          ]
+        }
+      }),
+      filePath => {
+        expect(() => loadConfig(filePath)).toThrow(/duplicate namespace 'products'/);
+      }
+    );
   });
 });
