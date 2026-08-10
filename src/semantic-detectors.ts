@@ -112,6 +112,16 @@ function containingVariableName(node: Node): string | undefined {
   return undefined;
 }
 
+function isInsideJsxExpression(node: Node): boolean {
+  let current: Node | undefined = node.getParent();
+  while (current) {
+    if (Node.isJsxExpression(current)) return true;
+    if (Node.isFunctionDeclaration(current) || Node.isArrowFunction(current) || Node.isFunctionExpression(current)) return false;
+    current = current.getParent();
+  }
+  return false;
+}
+
 function isTranslationApiCall(call: Node, config: ScannerConfig): boolean {
   if (!Node.isCallExpression(call)) return false;
   const callee = normalizeCallee(call.getExpression().getText());
@@ -339,6 +349,48 @@ function detectValidationMessages(
   }
 }
 
+function detectStateMessages(
+  sourceFile: SourceFile,
+  candidates: SemanticCandidate[],
+  seen: Set<string>
+): void {
+  for (const variable of sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+    const nameNode = variable.getNameNode();
+    const initializer = variable.getInitializer();
+    if (!Node.isArrayBindingPattern(nameNode) || !initializer || !Node.isCallExpression(initializer)) continue;
+    if (normalizeCallee(initializer.getExpression().getText()) !== 'useState') continue;
+
+    const elements = nameNode.getElements();
+    if (elements.length < 2) continue;
+    const stateName = elements[0]?.getNameNode().getText();
+    const setterName = elements[1]?.getNameNode().getText();
+    if (!stateName || !setterName) continue;
+
+    const rendered = sourceFile
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .some(identifier => identifier.getText() === stateName && isInsideJsxExpression(identifier));
+    if (!rendered) continue;
+
+    for (const call of sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      if (normalizeCallee(call.getExpression().getText()) !== setterName) continue;
+      const argument = call.getArguments()[0];
+      if (!argument || !stringBearingExpression(argument)) continue;
+      addCandidate(candidates, seen, {
+        node: argument,
+        kind: 'KnownFunctionArgument',
+        confidence: 'medium',
+        reason: `State setter '${setterName}' stores hardcoded copy that is rendered through '${stateName}'`,
+        context: {
+          type: 'StateMessage',
+          functionName: setterName,
+          argumentIndex: 0,
+          variableName: stateName
+        }
+      });
+    }
+  }
+}
+
 function insideMetadataContext(node: Node): boolean {
   const functionName = containingFunctionName(node);
   if (functionName === 'generateMetadata') return true;
@@ -380,6 +432,7 @@ export function detectSemanticCandidates(
   detectPresentationObjects(sourceFile, relativeFilePath, config, candidates, seen);
   detectInlineLocaleMaps(sourceFile, config, candidates, seen);
   detectValidationMessages(sourceFile, config, candidates, seen);
+  detectStateMessages(sourceFile, candidates, seen);
   detectNextMetadata(sourceFile, config, candidates, seen);
   return candidates.sort((a, b) => a.node.getStart() - b.node.getStart() || a.kind.localeCompare(b.kind));
 }
