@@ -73,6 +73,12 @@ export interface Finding {
 
 export type CodemodFramework = 'next-intl' | 'react-i18next' | 'generic';
 
+export interface CatalogRoute {
+  namespace: string;
+  messagesPath: string;
+  stripNamespace?: boolean;
+}
+
 export interface TranslationApiRule {
   callee: string;
   fallbackArgument?: number;
@@ -101,6 +107,7 @@ export interface ScannerConfig {
     clientHook: string;
     serverAsyncFunction: string;
     messagesPath: string;
+    catalogRoutes?: CatalogRoute[];
     catalogFormat: 'nested-json' | 'flat-json';
     keyStyle: string;
   };
