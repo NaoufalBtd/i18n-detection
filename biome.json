@@ -1,0 +1,38 @@
+{
+  "$schema": "https://biomejs.dev/schemas/1.8.3/schema.json",
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "style": {
+        "noJsxLiterals": {
+          "level": "warn",
+          "options": {
+            "noStrings": true,
+            "allowedStrings": ["OK", "ID", "API", "URL", "·", "—"]
+          }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "**/*.test.tsx",
+        "**/*.spec.tsx",
+        "**/*.stories.tsx",
+        "**/__tests__/**",
+        "**/mocks/**",
+        "**/fixtures/**",
+        "**/generated/**"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noJsxLiterals": "off"
+          }
+        }
+      }
+    }
+  ]
+}

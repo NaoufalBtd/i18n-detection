@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.i18n-scan-cache.json
+reports/
+*.log
