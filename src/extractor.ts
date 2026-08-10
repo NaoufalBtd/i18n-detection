@@ -201,6 +201,15 @@ export class Extractor {
       .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.line - b.line || a.column - b.column);
 
     for (const finding of activeFindings) {
+      if (finding.fixability !== 'safe') {
+        report.blockedFindings.push({
+          findingId: finding.id,
+          filePath: finding.filePath,
+          reason: `Finding kind '${finding.kind}' is review-only and cannot create catalog entries automatically`
+        });
+        continue;
+      }
+
       if (finding.texts && finding.texts.length > 1) {
         report.blockedFindings.push({
           findingId: finding.id,
