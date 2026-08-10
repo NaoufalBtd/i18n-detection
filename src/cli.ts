@@ -1,346 +1,362 @@
+#!/usr/bin/env node
+
 import { Command } from 'commander';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { loadConfig, DEFAULT_CONFIG } from './config.js';
 import { Scanner } from './scanner.js';
 import { Reporter } from './reporter.js';
 import { Extractor } from './extractor.js';
-import { CodemodEngine } from './codemod.js';
+import { CodemodEngine, selectFixableFindings } from './codemod.js';
 import { CacheManager } from './cache.js';
-import type { ScanReport, Finding, Confidence } from './types.js';
+import { writeFilesAtomically } from './io.js';
+import { TOOL_VERSION } from './version.js';
+import type { ScanReport, Finding, Confidence, ScannerConfig } from './types.js';
+
+class CliError extends Error {
+  constructor(message: string, public readonly exitCode = 2) {
+    super(message);
+    this.name = 'CliError';
+  }
+}
+
+function runGit(args: string[]): string {
+  try {
+    return execFileSync('git', args, {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CliError(`Git command failed: git ${args.join(' ')}\n${message}`);
+  }
+}
 
 function getGitChangedFiles(): string[] {
-  try {
-    const output = execSync('git status --porcelain', { encoding: 'utf8' });
-    return output
-      .split(/\r?\n/)
-      .map(line => line.slice(3).trim())
-      .filter(line => line.length > 0)
-      .map(line => path.resolve(process.cwd(), line))
-      .filter(file => fs.existsSync(file));
-  } catch (e) {
-    console.error('Error running git status. Make sure git is installed and this is a git repository.');
-    return [];
+  const records = runGit(['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+    .split('\0')
+    .filter(Boolean);
+  const files: string[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record.length < 4) continue;
+    const status = record.slice(0, 2);
+    const fileName = record.slice(3);
+    files.push(path.resolve(process.cwd(), fileName));
+    if (/[RC]/.test(status) && index + 1 < records.length) index++;
   }
+  return files.filter(file => fs.existsSync(file));
 }
 
 function getGitFilesSince(branch: string): string[] {
-  try {
-    const output = execSync(`git diff --name-only ${branch}`, { encoding: 'utf8' });
-    return output
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .filter(line => line.length > 0)
-      .map(line => path.resolve(process.cwd(), line))
-      .filter(file => fs.existsSync(file));
-  } catch (e) {
-    console.error(`Error running git diff since ${branch}.`);
-    return [];
+  const commit = runGit(['rev-parse', '--verify', `${branch}^{commit}`]).trim();
+  if (!commit) throw new CliError(`Unable to resolve Git ref '${branch}'`);
+  return runGit(['diff', '--name-only', '-z', `${commit}...HEAD`, '--'])
+    .split('\0')
+    .filter(Boolean)
+    .map(file => path.resolve(process.cwd(), file))
+    .filter(file => fs.existsSync(file));
+}
+
+function parseConfidence(value: string): Exclude<Confidence, 'ignored'> {
+  if (value === 'high' || value === 'medium' || value === 'low') return value;
+  throw new CliError(`Invalid confidence '${value}'. Expected high, medium, or low.`);
+}
+
+function recalculateSummary(report: ScanReport): void {
+  const active = report.findings.filter(finding => finding.confidence !== 'ignored');
+  report.summary.filesWithFindings = new Set(active.map(finding => finding.filePath)).size;
+  report.summary.totalFindings = active.length;
+  report.summary.highConfidence = active.filter(finding => finding.confidence === 'high').length;
+  report.summary.mediumConfidence = active.filter(finding => finding.confidence === 'medium').length;
+  report.summary.lowConfidence = active.filter(finding => finding.confidence === 'low').length;
+  report.summary.autoFixCandidates = active.filter(finding => finding.autoFixCandidate).length;
+  report.summary.needsReview = active.filter(finding => finding.needsReview).length;
+}
+
+function filterReportByConfidence(report: ScanReport, minimum: Exclude<Confidence, 'ignored'>): void {
+  const rank: Record<Exclude<Confidence, 'ignored'>, number> = { low: 0, medium: 1, high: 2 };
+  const threshold = rank[minimum];
+  report.findings = report.findings.filter(finding =>
+    finding.confidence === 'ignored' ? true : rank[finding.confidence] >= threshold
+  );
+  recalculateSummary(report);
+}
+
+async function resolveTargetFiles(
+  scanner: Scanner,
+  options: { files?: string; changed?: boolean; since?: string }
+): Promise<string[]> {
+  const allowed = new Set((await scanner.getTargetFiles()).map(file => path.resolve(file)));
+  let candidates: string[];
+  if (options.files) {
+    candidates = options.files.split(',').map(file => path.resolve(process.cwd(), file.trim()));
+  } else if (options.changed) {
+    candidates = getGitChangedFiles();
+  } else if (options.since) {
+    candidates = getGitFilesSince(options.since);
+  } else {
+    candidates = [...allowed];
   }
+  return [...new Set(candidates.map(file => path.resolve(file)))].filter(file => allowed.has(file)).sort();
+}
+
+function semanticFingerprint(finding: Partial<Finding>): string | undefined {
+  if (!finding.filePath || !finding.kind) return undefined;
+  const identity = JSON.stringify({
+    filePath: finding.filePath,
+    kind: finding.kind,
+    text: finding.texts ?? finding.normalizedText,
+    context: finding.userFacingContext,
+    variableName: finding.variableName,
+    propertyName: finding.propertyName
+  });
+  return `i18n-v1:${createHash('sha256').update(identity).digest('hex').slice(0, 20)}`;
+}
+
+function loadBaseline(filePath: string): { ids: Set<string>; fingerprints: Set<string> } {
+  if (!fs.existsSync(filePath)) return { ids: new Set(), fingerprints: new Set() };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as unknown;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CliError(`Failed to parse baseline at ${filePath}: ${message}`);
+  }
+
+  const ids = new Set<string>();
+  const fingerprints = new Set<string>();
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) if (typeof item === 'string') ids.add(item);
+    return { ids, fingerprints };
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { findings?: unknown }).findings)) {
+    throw new CliError(`Baseline at ${filePath} must be an array of IDs or a scan report with a findings array`);
+  }
+
+  for (const item of (parsed as { findings: unknown[] }).findings) {
+    if (!item || typeof item !== 'object') continue;
+    const finding = item as Partial<Finding>;
+    if (typeof finding.id === 'string') ids.add(finding.id);
+    if (typeof finding.fingerprint === 'string') fingerprints.add(finding.fingerprint);
+    else {
+      const migrated = semanticFingerprint(finding);
+      if (migrated) fingerprints.add(migrated);
+    }
+  }
+  return { ids, fingerprints };
+}
+
+function reportCatalogPlan(plan: ReturnType<Extractor['planCatalog']>): void {
+  console.log(`Catalog: ${path.relative(process.cwd(), plan.catalogPath) || plan.catalogPath}`);
+  console.log(`New entries: ${plan.report.newEntries.length}`);
+  console.log(`Existing/reused entries: ${plan.report.existingMatches.length + plan.report.similarValues.length}`);
+  console.log(`Key collisions: ${plan.report.keyCollisions.length}`);
+  console.log(`Blocked findings: ${plan.report.blockedFindings.length}`);
 }
 
 const program = new Command();
-
 program
   .name('i18n-scan')
-  .description('Enterprise i18n Hardcoded String Detector')
-  .version('1.0.0');
+  .description('Production-oriented AST detector for hardcoded user-facing strings')
+  .version(TOOL_VERSION);
 
 program
   .command('init')
-  .description('Initialize default i18n-scan.config.json configuration')
+  .description('Initialize i18n-scan.config.json')
   .action(() => {
     const configPath = path.resolve(process.cwd(), 'i18n-scan.config.json');
-    if (fs.existsSync(configPath)) {
-      console.error('i18n-scan.config.json already exists.');
-      process.exit(1);
-    }
-    fs.writeFileSync(configPath, JSON.stringify(DEFAULT_CONFIG, null, 2), 'utf8');
-    console.log('Created i18n-scan.config.json with default configuration.');
+    if (fs.existsSync(configPath)) throw new CliError('i18n-scan.config.json already exists.', 1);
+    writeFilesAtomically([{ filePath: configPath, content: `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n` }]);
+    console.log('Created i18n-scan.config.json.');
   });
 
 program
   .command('scan', { isDefault: true })
   .description('Scan project for hardcoded strings')
-  .option('--json <path>', 'Path to save JSON report')
-  .option('--markdown <path>', 'Path to save Markdown report')
-  .option('--sarif <path>', 'Path to save SARIF report')
-  .option('--fail-on-new', 'Fail if new high-confidence findings are found compared to baseline')
-  .option('--baseline <path>', 'Path to baseline file', 'i18n-scan.baseline.json')
-  .option('--confidence <level>', 'Minimum confidence level (high, medium, low)', 'low')
-  .option('--files <paths>', 'Comma-separated list of specific files to scan')
-  .option('--changed', 'Scan only changed files in Git status')
-  .option('--since <branch>', 'Scan only files changed since specified Git branch')
-  .option('--no-cache', 'Disable caching of scan results')
-  .option('--clear-cache', 'Clear existing scan cache')
-  .option('--config <path>', 'Path to configuration file')
-  .action(async (options) => {
+  .option('--json <path>', 'Save JSON report')
+  .option('--markdown <path>', 'Save Markdown report')
+  .option('--sarif <path>', 'Save SARIF report')
+  .option('--fail-on-new', 'Fail on new high-confidence findings compared with baseline')
+  .option('--baseline <path>', 'Baseline file', 'i18n-scan.baseline.json')
+  .option('--confidence <level>', 'Minimum confidence level', 'low')
+  .option('--files <paths>', 'Comma-separated files; still constrained by scanner include/exclude rules')
+  .option('--changed', 'Scan only changed Git files')
+  .option('--since <branch>', 'Scan files changed from the merge-base with a branch/ref')
+  .option('--no-cache', 'Disable scan cache')
+  .option('--clear-cache', 'Clear cache before scanning')
+  .option('--config <path>', 'Configuration file')
+  .action(async options => {
     const config = loadConfig(options.config);
-
-    if (options.clearCache) {
-      const cacheManager = new CacheManager(process.cwd());
-      cacheManager.clear();
-      console.log('Cache cleared successfully.');
-    }
-
+    if (options.clearCache) new CacheManager(process.cwd(), config).clear();
     const scanner = new Scanner(config);
-
-    let targetFiles: string[] = [];
-    if (options.files) {
-      targetFiles = options.files.split(',').map((f: string) => path.resolve(process.cwd(), f.trim()));
-    } else if (options.changed) {
-      const changed = getGitChangedFiles();
-      const allowed = new Set(await scanner.getTargetFiles());
-      targetFiles = changed.filter(f => allowed.has(f));
-      console.log(`Found ${targetFiles.length} changed files matching scanner configuration.`);
-    } else if (options.since) {
-      const changed = getGitFilesSince(options.since);
-      const allowed = new Set(await scanner.getTargetFiles());
-      targetFiles = changed.filter(f => allowed.has(f));
-      console.log(`Found ${targetFiles.length} changed files since ${options.since} matching scanner configuration.`);
-    } else {
-      targetFiles = await scanner.getTargetFiles();
-    }
-
+    const targetFiles = await resolveTargetFiles(scanner, options);
     if (targetFiles.length === 0) {
       console.log('No files found matching the configuration.');
-      process.exit(0);
+      return;
     }
 
-    console.log(`Scanning ${targetFiles.length} files...`);
-    const useCache = options.cache !== false;
-    const report = scanner.scanFiles(targetFiles, useCache);
-
-    // Apply confidence level filter
-    const minConfidence = options.confidence as Confidence;
-    const confidenceOrder: Confidence[] = ['low', 'medium', 'high'];
-    const minIdx = confidenceOrder.indexOf(minConfidence);
-
-    // Filter findings if necessary
-    if (minIdx > 0) {
-      report.findings = report.findings.filter(f => {
-        if (f.confidence === 'ignored') return true; // keep ignored findings
-        const idx = confidenceOrder.indexOf(f.confidence);
-        return idx >= minIdx;
-      });
-      // Recalculate summary
-      const active = report.findings.filter(f => f.confidence !== 'ignored');
-      report.summary.totalFindings = active.length;
-      report.summary.highConfidence = active.filter(f => f.confidence === 'high').length;
-      report.summary.mediumConfidence = active.filter(f => f.confidence === 'medium').length;
-      report.summary.lowConfidence = active.filter(f => f.confidence === 'low').length;
-      report.summary.autoFixCandidates = active.filter(f => f.autoFixCandidate).length;
-      report.summary.needsReview = active.filter(f => f.needsReview).length;
-    }
-
+    const report = scanner.scanFiles(targetFiles, options.cache !== false);
+    filterReportByConfidence(report, parseConfidence(options.confidence));
     const reporter = new Reporter(report);
+    if (options.json) reporter.save('json', options.json);
+    if (options.markdown) reporter.save('markdown', options.markdown);
+    if (options.sarif) reporter.save('sarif', options.sarif);
+    if (!options.json && !options.markdown && !options.sarif) console.log(reporter.toMarkdown());
 
-    // Output reports if specified
-    if (options.json) {
-      reporter.save('json', path.resolve(process.cwd(), options.json));
-      console.log(`Saved JSON report to ${options.json}`);
-    }
-    if (options.markdown) {
-      reporter.save('markdown', path.resolve(process.cwd(), options.markdown));
-      console.log(`Saved Markdown report to ${options.markdown}`);
-    }
-    if (options.sarif) {
-      reporter.save('sarif', path.resolve(process.cwd(), options.sarif));
-      console.log(`Saved SARIF report to ${options.sarif}`);
-    }
-
-    // Default: print summary to terminal
-    if (!options.json && !options.markdown && !options.sarif) {
-      console.log(reporter.toMarkdown());
-    }
-
-    // Check suppression reasons
     if (report.suppressions.withoutReason > 0) {
-      console.error(`Error: Found ${report.suppressions.withoutReason} suppression comments without a specified reason.`);
-      process.exit(1);
+      console.error(`Found ${report.suppressions.withoutReason} suppression comment(s) without a reason.`);
+      process.exitCode = 1;
     }
 
-    // Fail-on-new baseline comparison
     if (options.failOnNew) {
       const baselinePath = path.resolve(process.cwd(), options.baseline);
-      let baselineIds = new Set<string>();
-
-      if (fs.existsSync(baselinePath)) {
-        try {
-          const content = fs.readFileSync(baselinePath, 'utf8');
-          const baselineData = JSON.parse(content);
-          if (baselineData && Array.isArray(baselineData.findings)) {
-            baselineData.findings.forEach((f: any) => baselineIds.add(f.id));
-          } else if (Array.isArray(baselineData)) {
-            baselineData.forEach((id: string) => baselineIds.add(id));
-          }
-        } catch (e: any) {
-          console.warn(`Warning: Failed to parse baseline file at ${baselinePath}. Treating as empty.`);
-        }
-      } else {
-        console.log(`Baseline file not found at ${options.baseline}. All findings are treated as new.`);
-      }
-
-      // Check if any current high confidence finding is new
-      const newHighConfidenceFindings = report.findings.filter(
-        f => f.confidence === 'high' && !baselineIds.has(f.id)
+      const baseline = loadBaseline(baselinePath);
+      const newHigh = report.findings.filter(
+        finding =>
+          finding.confidence === 'high' &&
+          !baseline.ids.has(finding.id) &&
+          !baseline.fingerprints.has(finding.fingerprint)
       );
-
-      if (newHighConfidenceFindings.length > 0) {
-        console.error(`\nError: Found ${newHighConfidenceFindings.length} new high-confidence hardcoded string findings:`);
-        newHighConfidenceFindings.forEach(f => {
-          console.error(`  - ${f.filePath}:${f.line} [${f.kind}]: "${f.rawText || f.normalizedText}"`);
-        });
-        console.error(`\nPlease resolve these findings or update your baseline.`);
-        process.exit(1);
+      if (newHigh.length > 0) {
+        console.error(`Found ${newHigh.length} new high-confidence finding(s):`);
+        for (const finding of newHigh) console.error(`- ${finding.filePath}:${finding.line} ${finding.rawText ?? finding.normalizedText ?? ''}`);
+        process.exitCode = 1;
       } else {
-        console.log('No new high-confidence hardcoded strings found. CI check passed!');
+        console.log('No new high-confidence findings.');
       }
     }
-
-    process.exit(0);
   });
 
 program
   .command('extract')
-  .description('Extract hardcoded strings to translation catalog')
-  .option('--locale <locale>', 'Target locale (e.g. en, fr)', 'en')
-  .option('--merge', 'Merge new entries into the existing catalog file')
-  .option('--dry-run', 'Perform dry-run and print results without modifying files')
-  .option('--files <paths>', 'Comma-separated list of specific files to scan')
-  .option('--config <path>', 'Path to configuration file')
-  .action(async (options) => {
+  .description('Plan or merge source strings into a locale catalog')
+  .option('--locale <locale>', 'Catalog locale; defaults to configured source locale')
+  .option('--merge', 'Write safe new entries to the catalog')
+  .option('--dry-run', 'Never modify files')
+  .option('--files <paths>', 'Comma-separated files')
+  .option('--config <path>', 'Configuration file')
+  .action(async options => {
     const config = loadConfig(options.config);
+    const locale = options.locale ?? config.i18n.sourceLocale;
     const scanner = new Scanner(config);
-
-    let targetFiles: string[] = [];
-    if (options.files) {
-      targetFiles = options.files.split(',').map((f: string) => path.resolve(process.cwd(), f.trim()));
-    } else {
-      targetFiles = await scanner.getTargetFiles();
-    }
-
+    const targetFiles = await resolveTargetFiles(scanner, options);
     if (targetFiles.length === 0) {
       console.log('No files found matching the configuration.');
-      process.exit(0);
+      return;
     }
 
     const report = scanner.scanFiles(targetFiles);
     const extractor = new Extractor(config);
+    const plan = extractor.planCatalog(report.findings, locale);
+    reportCatalogPlan(plan);
 
-    console.log(`Extracting catalog for locale: ${options.locale}...`);
-    const collisions = extractor.extractCatalog(report.findings, options.merge, options.dryRun);
-
-    console.log('\n--- Catalog Extraction Summary ---');
-    console.log(`New entries found: ${collisions.newEntries.length}`);
-    console.log(`Similar values reusing existing keys: ${collisions.similarValues.length}`);
-    console.log(`Key collisions detected: ${collisions.keyCollisions.length}`);
-    console.log(`Already existing matched keys: ${collisions.existingMatches.length}`);
-
-    if (collisions.keyCollisions.length > 0) {
-      console.warn('\nWarning: The following key collisions were detected (same key suggested for a different value):');
-      collisions.keyCollisions.forEach(c => {
-        console.warn(`  - Key: "${c.key}" | Existing: "${c.oldValue}" | New: "${c.newValue}" in ${c.filePath}`);
-      });
-      console.warn('These collisions were NOT merged. Please review and rename keys manually.');
+    for (const collision of plan.report.keyCollisions) {
+      console.error(`Collision ${collision.key}: '${collision.oldValue}' vs '${collision.newValue}' (${collision.filePath})`);
+    }
+    for (const blocked of plan.report.blockedFindings) {
+      console.warn(`Review required ${blocked.filePath}: ${blocked.reason}`);
     }
 
-    if (collisions.newEntries.length > 0) {
-      if (options.merge) {
-        if (options.dryRun) {
-          console.log('\n[Dry-run] Would add the following new entries:');
-        } else {
-          console.log('\nSuccessfully merged the following new entries:');
-        }
-        collisions.newEntries.forEach(entry => {
-          console.log(`  - "${entry.key}": "${entry.value}"`);
-        });
-      } else {
-        console.log('\nNew entries (run with --merge to save to catalog):');
-        collisions.newEntries.forEach(entry => {
-          console.log(`  - "${entry.key}": "${entry.value}"`);
-        });
-      }
+    if (plan.report.keyCollisions.length > 0) {
+      process.exitCode = 1;
+      return;
     }
-
-    if (collisions.similarValues.length > 0) {
-      console.log('\nSuggestions for reuse (existing values matched under different keys):');
-      collisions.similarValues.forEach(s => {
-        console.log(`  - Re-use key "${s.existingKey}" for value "${s.value}" instead of creating "${s.key}" in ${s.filePath}`);
-      });
+    if (options.merge && !options.dryRun) {
+      extractor.writePlan(plan);
+      console.log(plan.changed ? 'Catalog updated atomically.' : 'Catalog already up to date.');
     }
-
-    process.exit(0);
   });
 
 program
   .command('apply')
-  .description('Safely and conservatively apply codemods to refactor high-confidence strings')
-  .option('--write', 'Write modifications directly to source files (default: dry-run)')
-  .option('--dry-run', 'Dry-run mode, print patches without writing (default)')
-  .option('--confidence <level>', 'Minimum confidence level to apply', 'high')
-  .option('--files <paths>', 'Only apply to these comma-separated files')
-  .option('--changed', 'Apply only to changed files in Git status')
-  .option('--since <branch>', 'Apply only to files changed since specified Git branch')
-  .option('--no-cache', 'Disable caching of scan results')
-  .option('--finding-id <id>', 'Only apply specific finding ID')
-  .option('--config <path>', 'Path to configuration file')
-  .action(async (options) => {
-    const config = loadConfig(options.config);
-    const scanner = new Scanner(config);
-
-    let targetFiles: string[] = [];
-    if (options.files) {
-      targetFiles = options.files.split(',').map((f: string) => path.resolve(process.cwd(), f.trim()));
-    } else if (options.changed) {
-      const changed = getGitChangedFiles();
-      const allowed = new Set(await scanner.getTargetFiles());
-      targetFiles = changed.filter(f => allowed.has(f));
-    } else if (options.since) {
-      const changed = getGitFilesSince(options.since);
-      const allowed = new Set(await scanner.getTargetFiles());
-      targetFiles = changed.filter(f => allowed.has(f));
-    } else {
-      targetFiles = await scanner.getTargetFiles();
+  .description('Plan or atomically apply safe next-intl codemods together with source-locale catalog updates')
+  .option('--write', 'Write source and catalog changes atomically; default is dry-run')
+  .option('--dry-run', 'Force dry-run')
+  .option('--confidence <level>', 'Minimum confidence level', 'high')
+  .option('--files <paths>', 'Comma-separated files')
+  .option('--changed', 'Apply only to changed Git files')
+  .option('--since <branch>', 'Apply to files changed from merge-base with branch/ref')
+  .option('--no-cache', 'Disable scan cache')
+  .option('--finding-id <id>', 'Apply only one finding ID')
+  .option('--config <path>', 'Configuration file')
+  .action(async options => {
+    const config: ScannerConfig = loadConfig(options.config);
+    if (!config.features.codemod) {
+      throw new CliError('Codemods are disabled. Set features.codemod=true after reviewing the configured i18n framework.', 1);
     }
 
+    const minimum = parseConfidence(options.confidence);
+    const scanner = new Scanner(config);
+    const targetFiles = await resolveTargetFiles(scanner, options);
     if (targetFiles.length === 0) {
       console.log('No files found to modify.');
-      process.exit(0);
+      return;
     }
 
-    const useCache = options.cache !== false;
-    const report = scanner.scanFiles(targetFiles, useCache);
+    const report = scanner.scanFiles(targetFiles, options.cache !== false);
+    const selected = selectFixableFindings(report.findings, { confidence: minimum, findingId: options.findingId });
+    if (selected.length === 0) {
+      console.log('No safe auto-fix findings matched the requested scope.');
+      return;
+    }
+
+    const extractor = new Extractor(config);
+    const catalogPlan = extractor.planCatalog(selected, config.i18n.sourceLocale);
+    reportCatalogPlan(catalogPlan);
+    if (catalogPlan.report.keyCollisions.length > 0 || catalogPlan.report.blockedFindings.length > 0) {
+      console.error('Refusing to plan source changes because the catalog plan is not deterministic.');
+      process.exitCode = 1;
+      return;
+    }
+
     const codemod = new CodemodEngine(config);
-
-    const isDryRun = !options.write || options.dryRun === true;
-
-    console.log(`${isDryRun ? '[Dry-run] ' : ''}Applying codemods to ${targetFiles.length} files...`);
-    const results = codemod.applyCodemods(report.findings, targetFiles, {
-      dryRun: isDryRun,
-      confidence: options.confidence,
-      findingId: options.findingId
+    const results = codemod.planCodemods(report.findings, targetFiles, {
+      dryRun: true,
+      confidence: minimum,
+      findingId: options.findingId,
+      keyOverrides: catalogPlan.keyByFindingId
     });
 
-    let totalModified = 0;
-    for (const res of results) {
-      if (res.modified) {
-        totalModified++;
-        console.log(`\nModified: ${res.filePath}`);
-        for (const patch of res.patches) {
-          console.log(`  Line ${patch.line}:`);
+    for (const result of results) {
+      if (result.modified) {
+        console.log(`\n${result.filePath}`);
+        for (const patch of result.patches) {
+          console.log(`  line ${patch.line}`);
           console.log(`  - ${patch.original}`);
           console.log(`  + ${patch.modified}`);
         }
       }
-      if (!res.success && res.error) {
-        console.error(`Error in ${res.filePath}: ${res.error}`);
-      }
+      for (const blocked of result.blocked) console.error(`Blocked ${result.filePath}: ${blocked.reason}`);
+      if (result.error) console.error(`Error ${result.filePath}: ${result.error}`);
     }
 
-    console.log(`\nCodemod completed. Total files modified: ${totalModified}`);
-    process.exit(0);
+    if (results.some(result => !result.success)) {
+      console.error('No files were written because at least one planned transformation was unsafe or invalid.');
+      process.exitCode = 1;
+      return;
+    }
+
+    const isDryRun = !options.write || options.dryRun === true;
+    if (isDryRun) {
+      console.log('\nDry-run complete. Source and catalog changes were validated but not written.');
+      return;
+    }
+
+    const writes = results
+      .filter(result => result.modified && result.plannedContent !== undefined)
+      .map(result => ({ filePath: path.resolve(process.cwd(), result.filePath), content: result.plannedContent! }));
+    if (catalogPlan.changed) writes.push({ filePath: catalogPlan.catalogPath, content: catalogPlan.outputContent });
+    writeFilesAtomically(writes);
+    console.log(`Atomically updated ${writes.length} file(s).`);
   });
 
-program.parse(process.argv);
+program.parseAsync(process.argv).catch(error => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  process.exitCode = error instanceof CliError ? error.exitCode : 2;
+});

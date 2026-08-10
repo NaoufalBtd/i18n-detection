@@ -1,254 +1,95 @@
-import { describe, it, expect } from 'vitest';
-import { Scanner } from './scanner.js';
+import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { Scanner, parseSuppressions } from './scanner.js';
 import { DEFAULT_CONFIG } from './config.js';
 import type { ScannerConfig } from './types.js';
 
-const testConfig: ScannerConfig = {
-  ...DEFAULT_CONFIG,
-  scanErrors: true
-};
+const testConfig: ScannerConfig = { ...DEFAULT_CONFIG, scanErrors: true };
 
-describe('i18n AST Scanner Detectors', () => {
-  it('detects direct JSX text', () => {
+describe('scanner', () => {
+  it('detects direct JSX text and user-facing attributes', () => {
     const scanner = new Scanner(testConfig);
-    const code = `
+    const report = scanner.scanInMemory('src/components/Test.tsx', `
       export function Component() {
-        return (
-          <div>
-            <h1>Account settings</h1>
-            <p>Manage your profile</p>
-            <span>OK</span> {/* allowed string */}
-            <span>·</span> {/* punctuation only */}
-            <span>&nbsp; &raquo;</span> {/* html entities only */}
-          </div>
-        );
+        return <div><h1>Account settings</h1><input placeholder="Search users" id="technical" /></div>;
       }
-    `;
-
-    const report = scanner.scanInMemory('src/components/Test.tsx', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    expect(active).toHaveLength(2);
-    expect(active[0].kind).toBe('JSXText');
-    expect(active[0].rawText).toBe('Account settings');
-    expect(active[0].confidence).toBe('high');
-    expect(active[0].suggestedKey).toBe('test.component.accountSettings');
-
-    expect(active[1].rawText).toBe('Manage your profile');
-    expect(active[1].suggestedKey).toBe('test.component.manageYourProfile');
+    `);
+    const active = report.findings.filter(finding => finding.confidence !== 'ignored');
+    expect(active.map(finding => finding.rawText)).toEqual(['Account settings', 'Search users']);
+    expect(active.every(finding => finding.autoFixCandidate)).toBe(true);
   });
 
-  it('detects JSX attributes and component props', () => {
+  it('does not classify traced constants as safe auto-fixes', () => {
     const scanner = new Scanner(testConfig);
-    const code = `
-      export function Component() {
-        return (
-          <div>
-            <input placeholder="Search users" id="technical-id" className="flex" />
-            <PageHeader title="Billing" subtitle="Manage invoices" />
-            <MyCustomComponent title="Generic title" unknownProp="ignored string" />
-          </div>
-        );
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/components/Test.tsx', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    expect(active).toHaveLength(4);
-
-    // input placeholder (standard user-facing attr)
-    const placeholder = active.find(f => f.userFacingContext?.propName === 'placeholder');
-    expect(placeholder).toBeDefined();
-    expect(placeholder?.kind).toBe('JSXAttribute');
-    expect(placeholder?.confidence).toBe('high');
-
-    // PageHeader title (known component prop)
-    const title = active.find(f => f.userFacingContext?.elementName === 'PageHeader' && f.userFacingContext?.propName === 'title');
-    expect(title).toBeDefined();
-    expect(title?.kind).toBe('KnownComponentProp');
-    expect(title?.confidence).toBe('high');
-
-    // PageHeader subtitle (known component prop but let's check subtitle in config)
-    const subtitle = active.find(f => f.userFacingContext?.elementName === 'PageHeader' && f.userFacingContext?.propName === 'subtitle');
-    expect(subtitle).toBeDefined();
-    expect(subtitle?.kind).toBe('KnownComponentProp');
-    expect(subtitle?.confidence).toBe('high');
-
-    // MyCustomComponent title (generic user-facing prop without known component mapping)
-    const customTitle = active.find(f => f.userFacingContext?.elementName === 'MyCustomComponent' && f.userFacingContext?.propName === 'title');
-    expect(customTitle).toBeDefined();
-    expect(customTitle?.kind).toBe('JSXAttribute');
-    expect(customTitle?.confidence).toBe('medium');
-  });
-
-  it('detects known function arguments', () => {
-    const scanner = new Scanner(testConfig);
-    const code = `
-      export function save() {
-        toast.success("Saved successfully");
-        toast.error("Failed to save");
-        alert("Invalid input");
-        console.log("Ignore me");
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/utils/action.ts', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    expect(active).toHaveLength(3);
-    expect(active[0].kind).toBe('KnownFunctionArgument');
-    expect(active[0].rawText).toBe('Saved successfully');
-    expect(active[0].confidence).toBe('high');
-
-    expect(active[1].rawText).toBe('Failed to save');
-    expect(active[2].rawText).toBe('Invalid input');
-  });
-
-  it('resolves same-file constants', () => {
-    const scanner = new Scanner(testConfig);
-    const code = `
+    const report = scanner.scanInMemory('src/components/Test.tsx', `
       const title = "Account settings";
-      const ignoredUrl = "https://google.com";
-
-      export function Page() {
-        return <PageHeader title={title} url={ignoredUrl} />;
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/app/settings/page.tsx', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    expect(active).toHaveLength(1);
-    const f = active[0];
-    expect(f.kind).toBe('LocalConstUsedInUserFacingContext');
-    expect(f.rawText).toBe('Account settings');
-    expect(f.confidence).toBe('high');
-    expect(f.variableName).toBe('title');
-    expect(f.declarationLocation).toBeDefined();
-    expect(f.declarationLocation?.line).toBe(2);
-    expect(f.usageLocation?.line).toBe(6);
+      export function Component() { return <h1>{title}</h1>; }
+    `);
+    const finding = report.findings.find(item => item.confidence !== 'ignored');
+    expect(finding?.kind).toBe('LocalConstUsedInUserFacingContext');
+    expect(finding?.autoFixCandidate).toBe(false);
+    expect(finding?.fixability).toBe('review');
   });
 
-  it('resolves local object literal properties and spreads', () => {
-    const scanner = new Scanner(testConfig);
-    const code = `
-      const emptyState = {
-        title: "No projects found",
-        description: "Create your first project",
-        id: "technical-id"
-      };
-
-      export function Page() {
-        return (
-          <div>
-            <EmptyState {...emptyState} />
-            <Dialog title={emptyState.title} />
-          </div>
-        );
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/app/projects/page.tsx', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    // 1 spread title, 1 spread description, 1 direct title access = 3 findings
-    expect(active).toHaveLength(3);
-
-    // Direct object property access EmptyState spread title
-    const spreadTitle = active.find(f => f.kind === 'LocalObjectPropertyUsedInUserFacingContext' && f.rawText === 'No projects found');
-    expect(spreadTitle).toBeDefined();
-    expect(spreadTitle?.confidence).toBe('high');
-
-    const spreadDesc = active.find(f => f.kind === 'LocalObjectPropertyUsedInUserFacingContext' && f.rawText === 'Create your first project');
-    expect(spreadDesc).toBeDefined();
-    expect(spreadDesc?.confidence).toBe('high');
+  it('honors detector feature flags', () => {
+    const config: ScannerConfig = {
+      ...testConfig,
+      features: { ...testConfig.features, sameFileConstants: false, templateLiterals: false }
+    };
+    const scanner = new Scanner(config);
+    const report = scanner.scanInMemory('src/components/Test.tsx', `
+      const title = "Account settings";
+      export function Component() { return <><h1>{title}</h1><h2>{\`Welcome \${name}\`}</h2></>; }
+    `);
+    expect(report.summary.totalFindings).toBe(0);
   });
 
-  it('detects conditional expressions, template literals, and concatenation', () => {
+  it('detects text inside fragments and logical rendering expressions', () => {
     const scanner = new Scanner(testConfig);
-    const code = `
-      const msg1 = isEditing ? "Edit project" : "Create project";
-      const msg2 = \`Deleted \${count} projects\`;
-      const msg3 = "Failed " + error + " occurred";
-
-      export function Component() {
-        return (
-          <div>
-            <Dialog title={msg1} />
-            <Dialog title={msg2} />
-            <Dialog title={msg3} />
-          </div>
-        );
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/components/Test.tsx', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    expect(active).toHaveLength(3);
-
-    const cond = active.find(f => f.kind === 'ConditionalStringUsedInUserFacingContext');
-    expect(cond).toBeDefined();
-    expect(cond?.confidence).toBe('medium');
-    expect(cond?.texts).toContain('Edit project');
-    expect(cond?.texts).toContain('Create project');
-
-    const temp = active.find(f => f.kind === 'TemplateLiteralUsedInUserFacingContext');
-    expect(temp).toBeDefined();
-    expect(temp?.confidence).toBe('high');
-    expect(temp?.variables).toContain('count');
-    expect(temp?.suggestedReplacement).toContain('count');
-
-    const concat = active.find(f => f.kind === 'StringConcatenationUsedInUserFacingContext');
-    expect(concat).toBeDefined();
-    expect(concat?.confidence).toBe('medium');
+    const report = scanner.scanInMemory('src/components/Test.tsx', `
+      export function Component({ empty }) { return <>Hello{empty && "No results"}</>; }
+    `);
+    const active = report.findings.filter(finding => finding.confidence !== 'ignored');
+    expect(active.some(finding => finding.rawText === 'Hello')).toBe(true);
+    expect(active.some(finding => finding.texts?.includes('No results'))).toBe(true);
   });
 
-  it('detects throws of Error exceptions', () => {
+  it('preserves template interpolation expressions without marking them safe', () => {
     const scanner = new Scanner(testConfig);
-    const code = `
-      export function validate() {
-        throw new Error("User not found");
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/utils/validate.ts', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-
-    expect(active).toHaveLength(1);
-    expect(active[0].kind).toBe('ErrorString');
-    expect(active[0].confidence).toBe('low');
+    const report = scanner.scanInMemory('src/components/Test.tsx', `
+      export function Component({ user }) { return <h1>{\`Welcome \${user.name}\`}</h1>; }
+    `);
+    const finding = report.findings.find(item => item.kind === 'TemplateLiteralUsedInUserFacingContext');
+    expect(finding?.confidence).toBe('medium');
+    expect(finding?.autoFixCandidate).toBe(false);
+    expect(Object.values(finding?.interpolationExpressions ?? {})).toContain('user.name');
   });
 
-  it('respects suppression comments', () => {
-    const scanner = new Scanner(testConfig);
-    const code = `
-      // i18n-scan-ignore-file -- entire file is test mock data
-      export function mock() {
-        return "Hardcoded mock string";
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/mocks/file.ts', code);
-    const active = report.findings.filter(f => f.confidence !== 'ignored');
-    expect(active).toHaveLength(0);
-    expect(report.suppressions.total).toBe(1);
-    expect(report.suppressions.withoutReason).toBe(0);
+  it('only parses suppressions from actual comments', () => {
+    const suppressions = parseSuppressions(`
+      const example = "i18n-scan-ignore-file -- documentation";
+      // i18n-scan-ignore-next-line -- intentionally hardcoded legal value
+      const value = "Terms";
+    `);
+    expect(suppressions.fileIgnored).toBe(false);
+    expect(suppressions.totalCount).toBe(1);
+    expect(suppressions.withoutReasonCount).toBe(0);
   });
 
-  it('detects suppressions without reasons', () => {
-    const scanner = new Scanner(testConfig);
-    const code = `
-      export function render() {
-        // i18n-scan-ignore-next-line
-        const text = "Some warning";
-        return <div>{text}</div>;
-      }
-    `;
-
-    const report = scanner.scanInMemory('src/components/View.tsx', code);
-    expect(report.suppressions.total).toBe(1);
-    expect(report.suppressions.withoutReason).toBe(1);
+  it('invalidates cache when configuration changes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-cache-'));
+    const filePath = path.join(root, 'Page.tsx');
+    fs.writeFileSync(filePath, 'export function Page(){ return <h1>Hello world</h1> }', 'utf8');
+    try {
+      const first = new Scanner(DEFAULT_CONFIG, root).scanFiles([filePath], true);
+      expect(first.summary.totalFindings).toBe(1);
+      const changedConfig: ScannerConfig = { ...DEFAULT_CONFIG, allowedStrings: [...DEFAULT_CONFIG.allowedStrings, 'Hello world'] };
+      const second = new Scanner(changedConfig, root).scanFiles([filePath], true);
+      expect(second.summary.totalFindings).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -1,195 +1,385 @@
-import { Project, SyntaxKind, Node, SourceFile } from 'ts-morph';
 import * as path from 'node:path';
-import type { Finding, ScannerConfig } from './types.js';
+import {
+  Project,
+  SyntaxKind,
+  Node,
+  type SourceFile,
+  type Block,
+  ts
+} from 'ts-morph';
+import type { Finding, ScannerConfig, Confidence } from './types.js';
+import { writeFilesAtomically } from './io.js';
 
 export interface CodemodResult {
   filePath: string;
   success: boolean;
   modified: boolean;
   error?: string;
+  blocked: { findingId: string; reason: string }[];
   patches: { line: number; original: string; modified: string }[];
+  plannedContent?: string;
+}
+
+export interface CodemodOptions {
+  dryRun: boolean;
+  confidence: Exclude<Confidence, 'ignored'>;
+  findingId?: string;
+  keyOverrides?: Record<string, string>;
+}
+
+interface TranslationBinding {
+  type: 'known' | 'unknown' | 'missing';
+  namespace?: string;
+}
+
+interface ComponentTarget {
+  block: Block;
+  async: boolean;
+  name: string;
+}
+
+interface PlannedInjection {
+  block: Block;
+  async: boolean;
 }
 
 function findNodeAtLineAndColumn(sourceFile: SourceFile, line: number, column: number): Node | undefined {
-  const matches = sourceFile.getDescendants().filter(desc => {
-    const start = desc.getStart();
-    const lc = sourceFile.getLineAndColumnAtPos(start);
-    return lc.line === line && lc.column === column;
+  const matches = sourceFile.getDescendants().filter(descendant => {
+    const location = sourceFile.getLineAndColumnAtPos(descendant.getStart());
+    return location.line === line && location.column === column;
   });
-  if (matches.length === 0) return undefined;
   matches.sort((a, b) => a.getWidth() - b.getWidth());
   return matches[0];
 }
 
-export function isTranslationFunctionAvailable(node: Node, tFuncName: string): boolean {
-  let curr: Node | undefined = node;
-  while (curr) {
-    if (
-      Node.isBlock(curr) ||
-      Node.isSourceFile(curr) ||
-      Node.isFunctionDeclaration(curr) ||
-      Node.isArrowFunction(curr) ||
-      Node.isFunctionExpression(curr) ||
-      Node.isMethodDeclaration(curr) ||
-      Node.isConstructorDeclaration(curr)
-    ) {
-      const locals = curr.getDescendantsOfKind(SyntaxKind.VariableDeclaration);
-      for (const local of locals) {
-        if (local.getName() === tFuncName) {
-          return true;
-        }
-      }
-    }
-    curr = curr.getParent();
+function isAncestor(ancestor: Node, node: Node): boolean {
+  let current: Node | undefined = node;
+  while (current) {
+    if (current === ancestor) return true;
+    current = current.getParent();
   }
   return false;
 }
 
-function findEnclosingFunctionBlock(node: Node): Node | undefined {
-  let curr: Node | undefined = node;
-  while (curr) {
-    if (Node.isFunctionDeclaration(curr) || Node.isMethodDeclaration(curr)) {
-      return curr.getBody();
+function declarationScope(node: Node): Node | undefined {
+  let current = node.getParent();
+  while (current) {
+    if (
+      Node.isForStatement(current) ||
+      Node.isForInStatement(current) ||
+      Node.isForOfStatement(current) ||
+      Node.isCatchClause(current)
+    ) {
+      return current;
     }
-    if (Node.isArrowFunction(curr) || Node.isFunctionExpression(curr)) {
-      const body = curr.getBody();
-      if (Node.isBlock(body)) {
-        return body;
-      }
-    }
-    curr = curr.getParent();
+    if (Node.isBlock(current) || Node.isSourceFile(current)) return current;
+    current = current.getParent();
   }
   return undefined;
 }
 
+function unwrapCall(node: Node | undefined): Node | undefined {
+  if (!node) return undefined;
+  if (Node.isAwaitExpression(node)) return node.getExpression();
+  return node;
+}
+
+function findVisibleTranslationBinding(node: Node, config: ScannerConfig): TranslationBinding {
+  const tName = config.i18n.translationFunctionName;
+  const candidates = node
+    .getSourceFile()
+    .getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+    .filter(declaration => declaration.getName() === tName && declaration.getStart() < node.getStart())
+    .filter(declaration => {
+      const scope = declarationScope(declaration);
+      return Boolean(scope && isAncestor(scope, node));
+    })
+    .sort((a, b) => b.getStart() - a.getStart());
+
+  const declaration = candidates[0];
+  if (!declaration) return { type: 'missing' };
+
+  const initializer = unwrapCall(declaration.getInitializer());
+  if (!initializer || !Node.isCallExpression(initializer)) return { type: 'unknown' };
+  const callName = initializer.getExpression().getText();
+  if (callName !== config.i18n.clientHook && callName !== config.i18n.serverAsyncFunction) {
+    return { type: 'unknown' };
+  }
+
+  const args = initializer.getArguments();
+  if (args.length === 0) return { type: 'known' };
+  if (args.length === 1 && Node.isStringLiteral(args[0])) {
+    return { type: 'known', namespace: args[0].getLiteralValue() };
+  }
+  return { type: 'unknown' };
+}
+
+function componentNameForFunction(node: Node): string | undefined {
+  if (Node.isFunctionDeclaration(node)) return node.getName();
+  if (Node.isArrowFunction(node) || Node.isFunctionExpression(node)) {
+    const parent = node.getParent();
+    if (parent && Node.isVariableDeclaration(parent)) return parent.getName();
+  }
+  return undefined;
+}
+
+function findEnclosingComponent(node: Node): ComponentTarget | undefined {
+  let current: Node | undefined = node;
+  while (current) {
+    if (Node.isFunctionDeclaration(current) || Node.isArrowFunction(current) || Node.isFunctionExpression(current)) {
+      const name = componentNameForFunction(current);
+      if (name && /^[A-Z]/.test(name)) {
+        const body = current.getBody();
+        if (body && Node.isBlock(body)) {
+          return { block: body, async: current.isAsync(), name };
+        }
+      }
+    }
+    current = current.getParent();
+  }
+  return undefined;
+}
+
+function bindingTextContainsName(bindingText: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-zA-Z0-9_$])${escaped}([^a-zA-Z0-9_$]|$)`).test(bindingText);
+}
+
+function scopeHasOwnTranslationName(block: Block, tName: string): boolean {
+  const variableBinding = block
+    .getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+    .some(declaration => bindingTextContainsName(declaration.getName(), tName) && declarationScope(declaration) === block);
+  if (variableBinding) return true;
+
+  const owner = block.getParent();
+  if (owner && (Node.isFunctionDeclaration(owner) || Node.isArrowFunction(owner) || Node.isFunctionExpression(owner))) {
+    return owner.getParameters().some(parameter => bindingTextContainsName(parameter.getName(), tName));
+  }
+  return false;
+}
+
+function ensureNamedImport(sourceFile: SourceFile, moduleSpecifier: string, symbol: string): void {
+  const imports = sourceFile.getImportDeclarations().filter(declaration => declaration.getModuleSpecifierValue() === moduleSpecifier);
+  const existingNamed = imports.find(declaration => !declaration.getNamespaceImport());
+  if (existingNamed) {
+    const hasSymbol = existingNamed.getNamedImports().some(namedImport => namedImport.getName() === symbol && !namedImport.getAliasNode());
+    if (!hasSymbol) existingNamed.addNamedImport(symbol);
+    return;
+  }
+  sourceFile.addImportDeclaration({ moduleSpecifier, namedImports: [symbol] });
+}
+
+function validateSyntax(filePath: string, content: string): string | undefined {
+  const result = ts.transpileModule(content, {
+    fileName: filePath,
+    reportDiagnostics: true,
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      jsx: ts.JsxEmit.ReactJSX
+    }
+  });
+  const errors = (result.diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error);
+  if (errors.length === 0) return undefined;
+  return errors
+    .map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
+    .join('; ');
+}
+
+export function selectFixableFindings(findings: Finding[], options: Pick<CodemodOptions, 'confidence' | 'findingId'>): Finding[] {
+  const rank: Record<Exclude<Confidence, 'ignored'>, number> = { low: 0, medium: 1, high: 2 };
+  const minimum = rank[options.confidence];
+  return findings.filter(finding => {
+    if (finding.confidence === 'ignored' || !finding.autoFixCandidate || finding.fixability !== 'safe') return false;
+    if (options.findingId && finding.id !== options.findingId) return false;
+    return rank[finding.confidence] >= minimum;
+  });
+}
+
+export function isTranslationFunctionAvailable(node: Node, tFuncName: string): boolean {
+  const config = {
+    i18n: {
+      translationFunctionName: tFuncName,
+      clientHook: 'useTranslations',
+      serverAsyncFunction: 'getTranslations'
+    }
+  } as ScannerConfig;
+  return findVisibleTranslationBinding(node, config).type === 'known';
+}
+
 export class CodemodEngine {
-  private config: ScannerConfig;
-  private projectRoot: string;
+  private readonly config: ScannerConfig;
+  private readonly projectRoot: string;
 
   constructor(config: ScannerConfig, projectRoot = process.cwd()) {
     this.config = config;
-    this.projectRoot = projectRoot;
+    this.projectRoot = path.resolve(projectRoot);
   }
 
-  public applyCodemods(
-    findings: Finding[],
-    targetFiles: string[],
-    options: { dryRun: boolean; confidence: string; findingId?: string }
-  ): CodemodResult[] {
-    const project = new Project({
-      compilerOptions: {
-        allowJs: true,
-        jsx: 1 // React
-      }
-    });
+  public planCodemods(findings: Finding[], targetFiles: string[], options: CodemodOptions): CodemodResult[] {
+    if (!this.config.features.codemod) {
+      throw new Error('Codemod feature is disabled. Set features.codemod=true to enable source transformations.');
+    }
+    const framework = this.config.codemod?.framework ?? 'generic';
+    if (framework !== 'next-intl') {
+      throw new Error(`Automatic codemods are currently production-supported only for next-intl; configured framework is '${framework}'.`);
+    }
 
-    const activeFindings = findings.filter(f => {
-      if (f.confidence === 'ignored') return false;
-      if (options.findingId && f.id !== options.findingId) return false;
-      if (options.confidence === 'high' && f.confidence !== 'high') return false;
-      if (options.confidence === 'medium' && f.confidence !== 'high' && f.confidence !== 'medium') return false;
-      return f.autoFixCandidate;
-    });
-
-    const findingsByFile: Record<string, Finding[]> = {};
-    for (const f of activeFindings) {
-      if (!findingsByFile[f.filePath]) {
-        findingsByFile[f.filePath] = [];
-      }
-      findingsByFile[f.filePath].push(f);
+    const selected = selectFixableFindings(findings, options);
+    const byFile = new Map<string, Finding[]>();
+    for (const finding of selected) {
+      const group = byFile.get(finding.filePath) ?? [];
+      group.push(finding);
+      byFile.set(finding.filePath, group);
     }
 
     const results: CodemodResult[] = [];
+    for (const absoluteFile of targetFiles.map(file => path.resolve(file)).sort()) {
+      const relativePath = path.relative(this.projectRoot, absoluteFile).replace(/\\/g, '/');
+      const fileFindings = byFile.get(relativePath);
+      if (!fileFindings?.length) continue;
 
-    for (const filePath of targetFiles) {
-      const relativePath = path.relative(this.projectRoot, filePath).replace(/\\/g, '/');
-      const fileFindings = findingsByFile[relativePath];
-      if (!fileFindings || fileFindings.length === 0) continue;
-
-      const sourceFile = project.addSourceFileAtPath(filePath);
-      const originalContent = sourceFile.getFullText();
-
-      // Sort findings by position from bottom to top to prevent coordinate shifting
-      const sortedFindings = [...fileFindings].sort((a, b) => b.line - a.line || b.column - a.column);
-
+      const project = new Project({
+        compilerOptions: { allowJs: true, jsx: ts.JsxEmit.ReactJSX }
+      });
+      const sourceFile = project.addSourceFileAtPath(absoluteFile);
       const result: CodemodResult = {
         filePath: relativePath,
         success: true,
         modified: false,
+        blocked: [],
         patches: []
       };
 
       try {
-        const tFuncName = this.config.i18n.translationFunctionName || 't';
-        let importInjected = false;
+        const targets = fileFindings
+          .map(finding => ({ finding, node: findNodeAtLineAndColumn(sourceFile, finding.line, finding.column) }))
+          .sort((a, b) => b.finding.line - a.finding.line || b.finding.column - a.finding.column);
+        const injections = new Map<Block, PlannedInjection>();
+        const plannedTargets: { finding: Finding; node: Node; key: string }[] = [];
 
-        for (const f of sortedFindings) {
-          const targetNode = findNodeAtLineAndColumn(sourceFile, f.line, f.column);
-          if (!targetNode) continue;
-
-          // Verify translation function 't' is available in scope
-          if (!isTranslationFunctionAvailable(targetNode, tFuncName)) {
-            let injected = false;
-            const hookStatement = this.config.codemod?.hookStatement;
-            const importStatement = this.config.codemod?.importStatement;
-
-            if (hookStatement && importStatement) {
-              const block = findEnclosingFunctionBlock(targetNode);
-              if (block && Node.isBlock(block)) {
-                block.insertStatements(0, hookStatement);
-                if (!importInjected && !sourceFile.getFullText().includes(importStatement)) {
-                  sourceFile.insertStatements(0, importStatement);
-                  importInjected = true;
-                }
-                injected = true;
-              }
-            }
-            if (!injected) continue; // Skip if we couldn't inject
+        for (const target of targets) {
+          const { finding, node } = target;
+          if (!node) {
+            result.blocked.push({ findingId: finding.id, reason: 'Finding location no longer resolves to an AST node' });
+            continue;
           }
 
-          const originalText = targetNode.getText();
-          let replacementText = f.suggestedReplacement;
-
-          if (!replacementText || !f.suggestedKey) continue;
-
-
-          const lineText = sourceFile.getFullText().split(/\r?\n/)[f.line - 1];
-
-          // safe substitution
-          if (f.kind === 'JSXText') {
-            targetNode.replaceWithText(replacementText);
-            result.modified = true;
-          } else if (f.kind === 'JSXAttribute' || f.kind === 'KnownComponentProp') {
-            // If parent is already a JsxExpression, omit the outer braces
-            if (Node.isJsxExpression(targetNode.getParent())) {
-              replacementText = `${tFuncName}("${f.suggestedKey}")`;
-            }
-            targetNode.replaceWithText(replacementText);
-            result.modified = true;
+          const key = options.keyOverrides?.[finding.id] ?? finding.suggestedKey;
+          if (!key) {
+            result.blocked.push({ findingId: finding.id, reason: 'No catalog key is available for this finding' });
+            continue;
           }
 
-          if (result.modified) {
-            const modifiedLineText = sourceFile.getFullText().split(/\r?\n/)[f.line - 1];
-            result.patches.push({
-              line: f.line,
-              original: lineText.trim(),
-              modified: modifiedLineText.trim()
+          const binding = findVisibleTranslationBinding(node, this.config);
+          if (binding.type === 'unknown') {
+            result.blocked.push({ findingId: finding.id, reason: `A '${this.config.i18n.translationFunctionName}' binding exists but is not a recognized next-intl translator` });
+            continue;
+          }
+          if (binding.type === 'known' && binding.namespace) {
+            result.blocked.push({
+              findingId: finding.id,
+              reason: `Existing translator is scoped to namespace '${binding.namespace}'; generated global keys are not rewritten across namespace boundaries automatically`
             });
+            continue;
+          }
+
+          if (binding.type === 'missing') {
+            const component = findEnclosingComponent(node);
+            if (!component) {
+              result.blocked.push({ findingId: finding.id, reason: 'No enclosing React component was found for safe translator injection' });
+              continue;
+            }
+            if (scopeHasOwnTranslationName(component.block, this.config.i18n.translationFunctionName)) {
+              result.blocked.push({
+                findingId: finding.id,
+                reason: `Component '${component.name}' already declares '${this.config.i18n.translationFunctionName}' in its scope`
+              });
+              continue;
+            }
+            if (component.async && !this.config.features.insertServerTranslations) {
+              result.blocked.push({ findingId: finding.id, reason: 'Server translation insertion is disabled by configuration' });
+              continue;
+            }
+            if (!component.async && !this.config.features.insertClientTranslations) {
+              result.blocked.push({ findingId: finding.id, reason: 'Client/shared translation insertion is disabled by configuration' });
+              continue;
+            }
+            injections.set(component.block, { block: component.block, async: component.async });
+          }
+
+          plannedTargets.push({ finding, node, key });
+        }
+
+        for (const target of plannedTargets) {
+          const { finding, node, key } = target;
+          const tName = this.config.i18n.translationFunctionName;
+          const originalLine = sourceFile.getFullText().split(/\r?\n/)[finding.line - 1] ?? '';
+          let replacement: string;
+          if (finding.fixStrategy === 'replace-jsx-text') {
+            replacement = `{${tName}("${key}")}`;
+          } else if (finding.fixStrategy === 'replace-jsx-attribute') {
+            replacement = Node.isJsxExpression(node.getParent()) ? `${tName}("${key}")` : `{${tName}("${key}")}`;
+          } else {
+            result.blocked.push({ findingId: finding.id, reason: `Unsupported fix strategy '${finding.fixStrategy ?? 'none'}'` });
+            continue;
+          }
+          node.replaceWithText(replacement);
+          result.modified = true;
+          const modifiedLine = sourceFile.getFullText().split(/\r?\n/)[finding.line - 1] ?? '';
+          result.patches.push({ line: finding.line, original: originalLine.trim(), modified: modifiedLine.trim() });
+        }
+
+        for (const injection of injections.values()) {
+          if (injection.async) {
+            ensureNamedImport(sourceFile, 'next-intl/server', this.config.i18n.serverAsyncFunction);
+            injection.block.insertStatements(0, `const ${this.config.i18n.translationFunctionName} = await ${this.config.i18n.serverAsyncFunction}();`);
+          } else {
+            ensureNamedImport(sourceFile, 'next-intl', this.config.i18n.clientHook);
+            injection.block.insertStatements(0, `const ${this.config.i18n.translationFunctionName} = ${this.config.i18n.clientHook}();`);
           }
         }
 
-        if (result.modified && !options.dryRun) {
-          sourceFile.saveSync();
+        if (result.modified) {
+          const plannedContent = sourceFile.getFullText();
+          const syntaxError = validateSyntax(absoluteFile, plannedContent);
+          if (syntaxError) {
+            result.success = false;
+            result.error = `Generated source is syntactically invalid: ${syntaxError}`;
+            result.modified = false;
+          } else {
+            result.plannedContent = plannedContent;
+          }
         }
-
+        if (result.blocked.length > 0) result.success = false;
         results.push(result);
-      } catch (err: any) {
+      } catch (error) {
         result.success = false;
-        result.error = err.message;
+        result.error = error instanceof Error ? error.message : String(error);
         results.push(result);
       }
     }
 
+    return results;
+  }
+
+  public applyCodemods(findings: Finding[], targetFiles: string[], options: CodemodOptions): CodemodResult[] {
+    const results = this.planCodemods(findings, targetFiles, options);
+    if (!options.dryRun) {
+      const blocked = results.filter(result => !result.success);
+      if (blocked.length > 0) {
+        throw new Error(`Refusing to write codemods because ${blocked.length} file(s) contain blocked or invalid transformations`);
+      }
+      writeFilesAtomically(
+        results
+          .filter(result => result.modified && result.plannedContent !== undefined)
+          .map(result => ({
+            filePath: path.resolve(this.projectRoot, result.filePath),
+            content: result.plannedContent!
+          }))
+      );
+    }
     return results;
   }
 }

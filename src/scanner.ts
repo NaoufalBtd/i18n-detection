@@ -1,24 +1,18 @@
-import * as path from 'node:path';
 import * as fs from 'node:fs';
-import { CacheManager } from './cache.js';
+import * as path from 'node:path';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fg from 'fast-glob';
 import {
   Project,
   SyntaxKind,
   Node,
   VariableDeclarationKind,
-  JsxText,
-  JsxAttribute,
-  JsxSpreadAttribute,
-  CallExpression,
-  VariableDeclaration,
-  ObjectLiteralExpression,
-  PropertyAccessExpression,
-  ThrowStatement,
-  NewExpression,
-  Expression,
-  SourceFile
+  type SourceFile,
+  ts
 } from 'ts-morph';
+import { CacheManager, hashContent } from './cache.js';
+import { REPORT_SCHEMA_VERSION } from './version.js';
 import type {
   ScannerConfig,
   Finding,
@@ -26,8 +20,8 @@ import type {
   FindingKind,
   UserFacingContext,
   ScanSummary,
-  SuppressionSummary,
-  ScanReport
+  ScanReport,
+  FixStrategy
 } from './types.js';
 
 export interface FileSuppressions {
@@ -39,76 +33,85 @@ export interface FileSuppressions {
   withoutReasonCount: number;
 }
 
+function lineStarts(content: string): number[] {
+  const starts = [0];
+  for (let index = 0; index < content.length; index++) {
+    if (content[index] === '\n') starts.push(index + 1);
+  }
+  return starts;
+}
+
+function lineAtPosition(starts: number[], position: number): number {
+  let low = 0;
+  let high = starts.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (starts[mid] <= position) low = mid + 1;
+    else high = mid - 1;
+  }
+  return high + 1;
+}
+
 export function parseSuppressions(content: string): FileSuppressions {
-  const lines = content.split(/\r?\n/);
+  const starts = lineStarts(content);
   const ignoredLines = new Set<number>();
   const ignoredBlocks: { start: number; end: number; reason?: string }[] = [];
   let fileIgnored = false;
   let fileIgnoreReason: string | undefined;
-
   let totalCount = 0;
   let withoutReasonCount = 0;
-
   let activeBlockStart: { line: number; reason?: string } | null = null;
 
-  for (let i = 0; i < lines.length; i++) {
-    const lineText = lines[i];
-    const lineNum = i + 1;
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.JSX, content);
+  let token = scanner.scan();
 
-    // 1. File ignore
-    const fileMatch = lineText.match(/i18n-scan-ignore-file(?:\s+--(.*))?/);
-    if (fileMatch) {
-      totalCount++;
-      const reason = fileMatch[1]?.trim();
-      if (!reason) {
-        withoutReasonCount++;
-      }
-      fileIgnored = true;
-      fileIgnoreReason = reason;
-    }
+  while (token !== ts.SyntaxKind.EndOfFileToken) {
+    if (token === ts.SyntaxKind.SingleLineCommentTrivia || token === ts.SyntaxKind.MultiLineCommentTrivia) {
+      const tokenStart = scanner.getTokenPos();
+      const tokenText = scanner.getTokenText();
+      const baseLine = lineAtPosition(starts, tokenStart);
+      const commentLines = tokenText.split(/\r?\n/);
 
-    // 2. Next line ignore
-    const nextLineMatch = lineText.match(/i18n-scan-ignore-next-line(?:\s+--(.*))?/);
-    if (nextLineMatch) {
-      totalCount++;
-      const reason = nextLineMatch[1]?.trim();
-      if (!reason) {
-        withoutReasonCount++;
-      }
-      ignoredLines.add(lineNum + 1);
-    }
+      for (let offset = 0; offset < commentLines.length; offset++) {
+        const lineText = commentLines[offset];
+        const lineNum = baseLine + offset;
 
-    // 3. Block ignore start
-    const startMatch = lineText.match(/i18n-scan-ignore-start(?:\s+--(.*))?/);
-    if (startMatch) {
-      totalCount++;
-      const reason = startMatch[1]?.trim();
-      if (!reason) {
-        withoutReasonCount++;
-      }
-      activeBlockStart = { line: lineNum, reason };
-    }
+        const fileMatch = lineText.match(/\bi18n-scan-ignore-file(?:\s+--\s*(.*))?/);
+        if (fileMatch) {
+          totalCount++;
+          const reason = fileMatch[1]?.trim();
+          if (!reason) withoutReasonCount++;
+          fileIgnored = true;
+          fileIgnoreReason = reason;
+        }
 
-    // 4. Block ignore end
-    const endMatch = lineText.match(/i18n-scan-ignore-end/);
-    if (endMatch) {
-      if (activeBlockStart) {
-        ignoredBlocks.push({
-          start: activeBlockStart.line,
-          end: lineNum,
-          reason: activeBlockStart.reason
-        });
-        activeBlockStart = null;
+        const nextLineMatch = lineText.match(/\bi18n-scan-ignore-next-line(?:\s+--\s*(.*))?/);
+        if (nextLineMatch) {
+          totalCount++;
+          const reason = nextLineMatch[1]?.trim();
+          if (!reason) withoutReasonCount++;
+          ignoredLines.add(lineNum + 1);
+        }
+
+        const startMatch = lineText.match(/\bi18n-scan-ignore-start(?:\s+--\s*(.*))?/);
+        if (startMatch) {
+          totalCount++;
+          const reason = startMatch[1]?.trim();
+          if (!reason) withoutReasonCount++;
+          if (!activeBlockStart) activeBlockStart = { line: lineNum, reason };
+        }
+
+        if (/\bi18n-scan-ignore-end\b/.test(lineText) && activeBlockStart) {
+          ignoredBlocks.push({ start: activeBlockStart.line, end: lineNum, reason: activeBlockStart.reason });
+          activeBlockStart = null;
+        }
       }
     }
+    token = scanner.scan();
   }
 
   if (activeBlockStart) {
-    ignoredBlocks.push({
-      start: activeBlockStart.line,
-      end: lines.length,
-      reason: activeBlockStart.reason
-    });
+    ignoredBlocks.push({ start: activeBlockStart.line, end: starts.length, reason: activeBlockStart.reason });
   }
 
   return {
@@ -131,267 +134,253 @@ interface TracedValue {
   propertyName?: string;
   properties?: Record<string, TracedValue>;
   variables?: string[];
+  interpolationExpressions?: Record<string, string>;
 }
 
-function camelCase(str: string): string {
-  const cleaned = str
-    .replace(/[^a-zA-Z0-9\s-_]/g, '')
+function camelCase(value: string): string {
+  const cleaned = value
+    .replace(/[^\p{L}\p{N}\s_-]/gu, '')
     .replace(/[-_]+/g, ' ')
     .trim();
   if (!cleaned) return '';
   return cleaned
     .split(/\s+/)
     .map((word, index) => {
-      if (index === 0) {
-        return word.toLowerCase();
-      }
+      if (index === 0) return word.toLowerCase();
       return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
     })
     .join('');
 }
 
-function hashCode(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return hash;
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 20);
 }
 
 function getContainingComponentName(node: Node): string | undefined {
-  let curr: Node | undefined = node;
-  while (curr) {
-    if (Node.isFunctionDeclaration(curr) || Node.isClassDeclaration(curr)) {
-      const name = curr.getName();
-      if (name && name[0] === name[0].toUpperCase()) {
-        return name;
-      }
+  let current: Node | undefined = node;
+  while (current) {
+    if (Node.isFunctionDeclaration(current) || Node.isClassDeclaration(current)) {
+      const name = current.getName();
+      if (name && /^[A-Z]/.test(name)) return name;
     }
-    if (Node.isVariableDeclaration(curr)) {
-      const name = curr.getName();
-      if (name && name[0] === name[0].toUpperCase()) {
-        return name;
-      }
+    if (Node.isVariableDeclaration(current)) {
+      const name = current.getName();
+      if (/^[A-Z]/.test(name)) return name;
     }
-    curr = curr.getParent();
+    current = current.getParent();
   }
   return undefined;
 }
 
+function expressionPlaceholder(expression: Node, index: number, used: Set<string>): string {
+  let base = `value${index}`;
+  if (Node.isIdentifier(expression)) base = expression.getText();
+  else if (Node.isPropertyAccessExpression(expression)) {
+    base = camelCase(`${expression.getExpression().getText()} ${expression.getName()}`) || base;
+  }
+  base = base.replace(/[^a-zA-Z0-9_$]/g, '') || `value${index}`;
+  if (!/^[a-zA-Z_$]/.test(base)) base = `value${index}`;
+
+  let candidate = base;
+  let suffix = 2;
+  while (used.has(candidate)) candidate = `${base}${suffix++}`;
+  used.add(candidate);
+  return candidate;
+}
+
 export class Scanner {
-  private config: ScannerConfig;
-  private projectRoot: string;
-  private project: Project;
+  private readonly config: ScannerConfig;
+  private readonly projectRoot: string;
+  private readonly project: Project;
 
   constructor(config: ScannerConfig, projectRoot = process.cwd()) {
     this.config = config;
-    this.projectRoot = projectRoot;
+    this.projectRoot = path.resolve(projectRoot);
     this.project = new Project({
       compilerOptions: {
         allowJs: true,
-        jsx: 1 // React
+        jsx: ts.JsxEmit.ReactJSX
       }
     });
   }
 
-  private isAllowedString(str: string): boolean {
-    return this.config.allowedStrings.includes(str.trim());
+  private isAllowedString(value: string): boolean {
+    return this.config.allowedStrings.includes(value.trim());
   }
 
-  private isPunctuationOnly(str: string): boolean {
-    return !/[\p{L}\p{N}]/u.test(str);
+  private isPunctuationOnly(value: string): boolean {
+    return !/[\p{L}\p{N}]/u.test(value);
   }
 
-  private isNumericOnly(str: string): boolean {
-    return /^[-+]?(?:\d+|\d*\.\d+)(?:[eE][-+]?\d+)?$/.test(str.trim());
+  private isNumericOnly(value: string): boolean {
+    return /^[-+]?(?:\d+|\d*\.\d+)(?:[eE][-+]?\d+)?$/.test(value.trim());
   }
 
-  private isCSSValue(str: string): boolean {
+  private isCSSValue(value: string): boolean {
     const cssPattern = /^[-+]?(?:\d+|\d*\.\d+)(px|rem|em|vh|vw|%|ms|s)$/i;
     const colorPattern = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
-    const strTrim = str.trim();
-    return cssPattern.test(strTrim) || colorPattern.test(strTrim);
+    const trimmed = value.trim();
+    return cssPattern.test(trimmed) || colorPattern.test(trimmed);
   }
 
-  private isHtmlEntityOnly(str: string): boolean {
-    return /^(?:&[a-zA-Z0-9#]+;\s*)+$/.test(str.trim());
+  private isHtmlEntityOnly(value: string): boolean {
+    return /^(?:&[a-zA-Z0-9#]+;\s*)+$/.test(value.trim());
+  }
+
+  private isIgnorable(value: string): boolean {
+    const normalized = value.trim();
+    return (
+      this.isAllowedString(value) ||
+      this.isPunctuationOnly(normalized) ||
+      this.isNumericOnly(normalized) ||
+      this.isCSSValue(normalized) ||
+      this.isHtmlEntityOnly(normalized)
+    );
   }
 
   private inferNamespace(filePath: string): string {
-    const normalizedPath = filePath.replace(/\\/g, '/');
+    const normalized = filePath.replace(/\\/g, '/');
+    const segments = normalized.split('/');
+    const featureIndex = segments.indexOf('features');
+    if (featureIndex >= 0 && segments[featureIndex + 1]) return camelCase(segments[featureIndex + 1]);
 
-    const featureMatch = normalizedPath.match(/src\/features\/([^/]+)/);
-    if (featureMatch) return featureMatch[1].toLowerCase();
-
-    const routeMatch = normalizedPath.match(/src\/app\/([^/]+)/);
-    if (routeMatch) return routeMatch[1].toLowerCase();
-
-    const componentMatch = normalizedPath.match(/src\/components\/([^/]+)/);
-    if (componentMatch) return componentMatch[1].replace(/\.[jt]sx?$/, '').toLowerCase();
-
-    const parsed = path.parse(normalizedPath);
-    if (parsed.name && parsed.name !== 'index' && parsed.name !== 'page') {
-      return parsed.name.toLowerCase();
+    const appIndex = segments.indexOf('app');
+    if (appIndex >= 0) {
+      for (const segment of segments.slice(appIndex + 1, -1)) {
+        if (!segment || segment.startsWith('(') || segment.startsWith('[') || segment.startsWith('@')) continue;
+        return camelCase(segment) || 'common';
+      }
     }
+
+    const componentIndex = segments.indexOf('components');
+    if (componentIndex >= 0 && segments[componentIndex + 1]) {
+      const candidate = segments[componentIndex + 1].replace(/\.[jt]sx?$/, '');
+      return camelCase(candidate) || 'common';
+    }
+
+    const parsed = path.parse(normalized);
+    if (parsed.name && parsed.name !== 'index' && parsed.name !== 'page') return camelCase(parsed.name) || 'common';
     return 'common';
   }
 
   private generateSuggestedKey(text: string, namespace: string, contextName?: string, propOrKey?: string): string {
     const trimmed = text.trim();
-    if (this.config.commonMappings && trimmed in this.config.commonMappings) {
-      return this.config.commonMappings[trimmed];
-    }
+    if (trimmed in this.config.commonMappings) return this.config.commonMappings[trimmed];
 
-    const fileOrComponent = contextName ? camelCase(contextName) : 'general';
-    let semantic = propOrKey ? camelCase(propOrKey) : camelCase(trimmed.slice(0, 20));
-    if (!semantic) {
-      semantic = 'text_' + Math.abs(hashCode(trimmed));
-    }
-
-    return `${namespace}.${fileOrComponent}.${semantic}`;
+    const context = contextName ? camelCase(contextName) : 'general';
+    let semantic = propOrKey ? camelCase(propOrKey) : camelCase(trimmed.slice(0, 40));
+    if (!semantic) semantic = `text${shortHash(trimmed).slice(0, 8)}`;
+    return `${namespace}.${context || 'general'}.${semantic}`;
   }
 
-  private generateSuggestedReplacement(key: string, contextType: string, variables?: string[]): string {
-    const tFuncName = this.config.i18n.translationFunctionName || 't';
-    let varObj = '';
-    if (variables && variables.length > 0) {
-      varObj = `, { ${variables.join(', ')} }`;
-    }
-    if (contextType === 'JSXText' || contextType === 'JSXAttribute') {
-      return `{${tFuncName}("${key}"${varObj})}`;
-    }
-    return `${tFuncName}("${key}"${varObj})`;
+  private generateSuggestedReplacement(key: string, contextType: string, expressions?: Record<string, string>): string {
+    const tName = this.config.i18n.translationFunctionName || 't';
+    const params = expressions && Object.keys(expressions).length > 0
+      ? `, { ${Object.entries(expressions).map(([name, expression]) => `${name}: ${expression}`).join(', ')} }`
+      : '';
+    const call = `${tName}("${key}"${params})`;
+    return contextType === 'JSXText' || contextType === 'JSXAttribute' ? `{${call}}` : call;
   }
 
   private resolveExpression(node: Node, visited = new Set<Node>()): TracedValue {
-    if (visited.has(node)) {
-      return { type: 'unknown', node };
-    }
+    if (visited.has(node)) return { type: 'unknown', node };
     visited.add(node);
 
     if (Node.isStringLiteral(node) || Node.isNoSubstitutionTemplateLiteral(node)) {
-      return {
-        type: 'string',
-        value: node.getLiteralValue(),
-        node
-      };
+      return { type: 'string', value: node.getLiteralValue(), node };
     }
 
     if (Node.isTemplateExpression(node)) {
-      const head = node.getHead().getLiteralText();
-      const templateSpans = node.getTemplateSpans();
-      let value = head;
+      if (!this.config.features.templateLiterals) return { type: 'unknown', node };
+      let value = node.getHead().getLiteralText();
       const variables: string[] = [];
-      
-      for (const span of templateSpans) {
+      const interpolationExpressions: Record<string, string> = {};
+      const used = new Set<string>();
+      node.getTemplateSpans().forEach((span, index) => {
         const expression = span.getExpression();
-        let varName = `var${variables.length}`;
-        if (Node.isIdentifier(expression)) {
-          varName = expression.getText();
-        } else if (Node.isPropertyAccessExpression(expression)) {
-          varName = expression.getName();
-        }
-        variables.push(varName);
-        value += `{{${varName}}}`;
-        value += span.getLiteral().getLiteralText();
-      }
-
-      return {
-        type: 'template_literal',
-        value,
-        variables,
-        node
-      };
+        const placeholder = expressionPlaceholder(expression, index, used);
+        variables.push(placeholder);
+        interpolationExpressions[placeholder] = expression.getText();
+        value += `{${placeholder}}${span.getLiteral().getLiteralText()}`;
+      });
+      return { type: 'template_literal', value, variables, interpolationExpressions, node };
     }
 
     if (Node.isBinaryExpression(node)) {
       const operator = node.getOperatorToken().getKind();
       if (operator === SyntaxKind.PlusToken) {
-        return {
-          type: 'concatenation',
-          node
-        };
+        return this.config.features.stringConcatenation
+          ? { type: 'concatenation', node }
+          : { type: 'unknown', node };
+      }
+      if (
+        this.config.features.conditionalStrings &&
+        (operator === SyntaxKind.AmpersandAmpersandToken || operator === SyntaxKind.BarBarToken || operator === SyntaxKind.QuestionQuestionToken)
+      ) {
+        const left = this.resolveExpression(node.getLeft(), new Set(visited));
+        const right = this.resolveExpression(node.getRight(), new Set(visited));
+        const texts: string[] = [];
+        for (const resolved of [left, right]) {
+          if (resolved.type === 'string' && resolved.value) texts.push(resolved.value);
+          if (resolved.type === 'conditional' && resolved.texts) texts.push(...resolved.texts);
+        }
+        if (texts.length > 0) return { type: 'conditional', texts: [...new Set(texts)], node };
       }
     }
 
     if (Node.isConditionalExpression(node)) {
-      const whenTrue = this.resolveExpression(node.getWhenTrue(), visited);
-      const whenFalse = this.resolveExpression(node.getWhenFalse(), visited);
+      if (!this.config.features.conditionalStrings) return { type: 'unknown', node };
+      const whenTrue = this.resolveExpression(node.getWhenTrue(), new Set(visited));
+      const whenFalse = this.resolveExpression(node.getWhenFalse(), new Set(visited));
       const texts: string[] = [];
       if (whenTrue.type === 'string' && whenTrue.value) texts.push(whenTrue.value);
       if (whenTrue.type === 'conditional' && whenTrue.texts) texts.push(...whenTrue.texts);
       if (whenFalse.type === 'string' && whenFalse.value) texts.push(whenFalse.value);
       if (whenFalse.type === 'conditional' && whenFalse.texts) texts.push(...whenFalse.texts);
-
-      return {
-        type: 'conditional',
-        texts: texts.length > 0 ? texts : undefined,
-        node
-      };
+      return { type: 'conditional', texts: texts.length > 0 ? [...new Set(texts)] : undefined, node };
     }
 
-    if (Node.isIdentifier(node)) {
-      const defs = node.getDefinitionNodes();
-      if (defs.length === 1) {
-        const def = defs[0];
-        if (Node.isVariableDeclaration(def)) {
-          const statement = def.getVariableStatement();
-          if (statement && statement.getDeclarationKind() === VariableDeclarationKind.Const) {
-            const initializer = def.getInitializer();
-            if (initializer) {
-              const resolved = this.resolveExpression(initializer, visited);
-              resolved.declarationNode = def;
-              resolved.variableName = def.getName();
-              return resolved;
-            }
-          }
-        }
-      }
-    }
-
-    if (Node.isPropertyAccessExpression(node)) {
-      const expression = node.getExpression();
-      const name = node.getName();
-      const resolvedObj = this.resolveExpression(expression, visited);
-      if (resolvedObj.type === 'object' && resolvedObj.properties && resolvedObj.properties[name]) {
-        const resolvedProp = { ...resolvedObj.properties[name] };
-        resolvedProp.propertyName = name;
-        return resolvedProp;
-      }
-    }
-
-    if (Node.isObjectLiteralExpression(node)) {
-      const properties: Record<string, TracedValue> = {};
-      for (const prop of node.getProperties()) {
-        if (Node.isPropertyAssignment(prop)) {
-          const name = prop.getName();
-          const initializer = prop.getInitializer();
+    if (Node.isIdentifier(node) && this.config.features.sameFileConstants) {
+      const definitions = node.getDefinitionNodes();
+      if (definitions.length === 1 && Node.isVariableDeclaration(definitions[0])) {
+        const declaration = definitions[0];
+        const statement = declaration.getVariableStatement();
+        if (statement?.getDeclarationKind() === VariableDeclarationKind.Const) {
+          const initializer = declaration.getInitializer();
           if (initializer) {
-            properties[name] = this.resolveExpression(initializer, visited);
+            const resolved = this.resolveExpression(initializer, visited);
+            resolved.declarationNode = declaration;
+            resolved.variableName = declaration.getName();
+            return resolved;
           }
         }
       }
-      return {
-        type: 'object',
-        properties,
-        node
-      };
     }
 
-    return {
-      type: 'unknown',
-      node
-    };
+    if (Node.isPropertyAccessExpression(node) && this.config.features.sameFileObjects) {
+      const resolvedObject = this.resolveExpression(node.getExpression(), visited);
+      const name = node.getName();
+      if (resolvedObject.type === 'object' && resolvedObject.properties?.[name]) {
+        return { ...resolvedObject.properties[name], propertyName: name };
+      }
+    }
+
+    if (Node.isObjectLiteralExpression(node) && this.config.features.sameFileObjects) {
+      const properties: Record<string, TracedValue> = {};
+      for (const property of node.getProperties()) {
+        if (!Node.isPropertyAssignment(property)) continue;
+        const initializer = property.getInitializer();
+        if (initializer) properties[property.getName()] = this.resolveExpression(initializer, new Set(visited));
+      }
+      return { type: 'object', properties, node };
+    }
+
+    return { type: 'unknown', node };
   }
 
   private isLineSuppressed(line: number, suppressions: FileSuppressions): boolean {
-    if (suppressions.fileIgnored) return true;
-    if (suppressions.ignoredLines.has(line)) return true;
-    for (const block of suppressions.ignoredBlocks) {
-      if (line >= block.start && line <= block.end) return true;
-    }
-    return false;
+    if (suppressions.fileIgnored || suppressions.ignoredLines.has(line)) return true;
+    return suppressions.ignoredBlocks.some(block => line >= block.start && line <= block.end);
   }
 
   private buildFinding(
@@ -405,131 +394,108 @@ export class Scanner {
     suppressions: FileSuppressions
   ): Finding | null {
     const sourceFile = node.getSourceFile();
-    const startPos = node.getStart();
-    const endPos = node.getEnd();
-    const lc = sourceFile.getLineAndColumnAtPos(startPos);
-    const endLc = sourceFile.getLineAndColumnAtPos(endPos);
+    const start = sourceFile.getLineAndColumnAtPos(node.getStart());
+    const end = sourceFile.getLineAndColumnAtPos(node.getEnd());
+    let finalConfidence = this.isLineSuppressed(start.line, suppressions) ? 'ignored' : confidence;
 
-    let finalConfidence = confidence;
-    if (this.isLineSuppressed(lc.line, suppressions)) {
-      finalConfidence = 'ignored';
-    }
-
-    // Determine raw and normalized texts
     let rawText: string | undefined;
     let normalizedText: string | undefined;
     let texts: string[] | undefined;
 
     if (traced.type === 'string' && traced.value !== undefined) {
+      if (this.isIgnorable(traced.value)) return null;
       rawText = traced.value;
       normalizedText = traced.value.trim().replace(/\s+/g, ' ');
-      if (
-        this.isAllowedString(rawText) ||
-        this.isPunctuationOnly(normalizedText) ||
-        this.isNumericOnly(normalizedText) ||
-        this.isCSSValue(normalizedText) ||
-        this.isHtmlEntityOnly(normalizedText)
-      ) {
-        return null;
-      }
     } else if (traced.type === 'conditional' && traced.texts) {
-      texts = traced.texts.filter(
-        t =>
-          !this.isAllowedString(t) &&
-          !this.isPunctuationOnly(t) &&
-          !this.isNumericOnly(t) &&
-          !this.isCSSValue(t) &&
-          !this.isHtmlEntityOnly(t)
-      );
+      texts = traced.texts.filter(text => !this.isIgnorable(text));
       if (texts.length === 0) return null;
-      rawText = traced.node.getText();
+      rawText = String(traced.node.getText());
       normalizedText = rawText.trim().replace(/\s+/g, ' ');
     } else {
-      rawText = traced.node.getText();
+      rawText = String(traced.node.getText());
       normalizedText = rawText.trim().replace(/\s+/g, ' ');
     }
 
-    // Adjust kind if resolved from local const or object property
     let finalKind = kind;
-    let declLoc: { file: string; line: number; column: number } | undefined;
-    let usageLoc: { file: string; line: number; column: number } | undefined;
+    let declarationLocation: Finding['declarationLocation'];
+    let usageLocation: Finding['usageLocation'];
 
     if (traced.declarationNode) {
-      const dFile = traced.declarationNode.getSourceFile();
-      const dStart = traced.declarationNode.getStart();
-      const dLc = dFile.getLineAndColumnAtPos(dStart);
-      const dRelPath = path.relative(this.projectRoot, dFile.getFilePath()).replace(/\\/g, '/');
-
-      declLoc = {
-        file: dRelPath,
-        line: dLc.line,
-        column: dLc.column
+      const declarationFile = traced.declarationNode.getSourceFile();
+      const declarationStart = declarationFile.getLineAndColumnAtPos(traced.declarationNode.getStart());
+      declarationLocation = {
+        file: path.relative(this.projectRoot, declarationFile.getFilePath()).replace(/\\/g, '/'),
+        line: declarationStart.line,
+        column: declarationStart.column
       };
-
-      usageLoc = {
-        file: relativeFilePath,
-        line: lc.line,
-        column: lc.column
-      };
-
-      if (traced.propertyName) {
-        finalKind = 'LocalObjectPropertyUsedInUserFacingContext';
-      } else {
-        finalKind = 'LocalConstUsedInUserFacingContext';
-      }
+      usageLocation = { file: relativeFilePath, line: start.line, column: start.column };
+      finalKind = traced.propertyName
+        ? 'LocalObjectPropertyUsedInUserFacingContext'
+        : 'LocalConstUsedInUserFacingContext';
     }
 
-    // Check dynamic kinds (template literals & concatenations)
     if (traced.type === 'template_literal') {
       finalKind = 'TemplateLiteralUsedInUserFacingContext';
-      if (traced.variables && traced.variables.length > 0) {
-        finalConfidence = 'high';
-        reason = 'Template literal extracted with variables';
-      } else {
-        finalConfidence = 'medium';
-        reason = 'Template literal may require interpolation and pluralization';
-      }
+      finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
+      reason = 'Template literal requires interpolation/pluralization review';
     } else if (traced.type === 'concatenation') {
       finalKind = 'StringConcatenationUsedInUserFacingContext';
-      finalConfidence = 'medium';
-      reason = 'String concatenation may require translation placeholders';
+      finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
+      reason = 'String concatenation requires translation placeholder review';
     } else if (traced.type === 'conditional') {
       finalKind = 'ConditionalStringUsedInUserFacingContext';
-      finalConfidence = 'medium';
+      finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
       reason = 'Conditional expression contains multiple hardcoded strings';
     }
 
-    // Key generation
     const namespace = this.inferNamespace(relativeFilePath);
-
-    // Determine containing React component name or file name
     const containingComponent = getContainingComponentName(node);
-    let fileOrComponent = 'general';
-    if (context.type === 'JSXAttribute' && context.elementName && context.elementName[0] === context.elementName[0].toUpperCase()) {
-      fileOrComponent = context.elementName;
+    let contextName = 'general';
+    if (context.type === 'JSXAttribute' && context.elementName && /^[A-Z]/.test(context.elementName)) {
+      contextName = context.elementName;
     } else if (containingComponent) {
-      fileOrComponent = containingComponent;
+      contextName = containingComponent;
     } else {
-      fileOrComponent = path.basename(relativeFilePath, path.extname(relativeFilePath));
+      contextName = path.basename(relativeFilePath, path.extname(relativeFilePath));
     }
 
-    let propOrKey = context.propName || traced.variableName || traced.propertyName;
-    const suggestedKey = this.generateSuggestedKey(texts ? texts[0] : (rawText || ''), namespace, fileOrComponent, propOrKey);
-    const suggestedReplacement = this.generateSuggestedReplacement(suggestedKey, context.type, traced.variables);
+    const propOrKey = context.propName || traced.variableName || traced.propertyName;
+    const keySource = texts?.[0] ?? rawText ?? traced.value ?? '';
+    const suggestedKey = this.generateSuggestedKey(keySource, namespace, contextName, propOrKey);
+    const suggestedReplacement = this.generateSuggestedReplacement(
+      suggestedKey,
+      context.type,
+      traced.interpolationExpressions
+    );
 
-    const isAutoFix =
-      finalConfidence === 'high' &&
-      finalKind !== 'ConditionalStringUsedInUserFacingContext' &&
-      finalKind !== 'StringConcatenationUsedInUserFacingContext' &&
-      finalKind !== 'ErrorString';
+    const directLiteral = traced.type === 'string' && !traced.declarationNode;
+    const fixStrategy: FixStrategy | undefined =
+      directLiteral && finalKind === 'JSXText'
+        ? 'replace-jsx-text'
+        : directLiteral && (finalKind === 'JSXAttribute' || finalKind === 'KnownComponentProp')
+          ? 'replace-jsx-attribute'
+          : undefined;
+    const autoFixCandidate = finalConfidence === 'high' && Boolean(fixStrategy);
+    const fixability = autoFixCandidate ? 'safe' : finalConfidence === 'ignored' ? 'unsupported' : 'review';
+
+    const semanticIdentity = JSON.stringify({
+      filePath: relativeFilePath,
+      kind: finalKind,
+      text: texts ?? normalizedText,
+      context,
+      variableName: traced.variableName,
+      propertyName: traced.propertyName
+    });
+    const fingerprint = `i18n-v1:${shortHash(semanticIdentity)}`;
 
     return {
-      id: `${relativeFilePath}:${lc.line}:${lc.column}:${finalKind.toLowerCase().replace(/usedinuserfacingcontext/g, '')}`,
+      id: `${relativeFilePath}:${start.line}:${start.column}:${finalKind.toLowerCase()}`,
+      fingerprint,
       filePath: relativeFilePath,
-      line: lc.line,
-      column: lc.column,
-      endLine: endLc.line,
-      endColumn: endLc.column,
+      line: start.line,
+      column: start.column,
+      endLine: end.line,
+      endColumn: end.column,
       rawText,
       normalizedText,
       texts,
@@ -540,129 +506,105 @@ export class Scanner {
       suggestedKey,
       suggestedReplacement,
       existingSimilarKey: null,
-      duplicateGroupId: `text:${(normalizedText || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
-      autoFixCandidate: isAutoFix,
-      needsReview: !isAutoFix,
+      duplicateGroupId: `text:${shortHash((texts ?? [normalizedText ?? '']).join('\u0000').toLocaleLowerCase())}`,
+      autoFixCandidate,
+      fixability,
+      fixStrategy,
+      needsReview: !autoFixCandidate && finalConfidence !== 'ignored',
       tags: [context.type.toLowerCase(), finalConfidence],
-      declarationLocation: declLoc,
-      usageLocation: usageLoc,
+      declarationLocation,
+      usageLocation,
       variableName: traced.variableName,
       propertyName: traced.propertyName,
-      variables: traced.variables
+      variables: traced.variables,
+      interpolationExpressions: traced.interpolationExpressions
     };
   }
 
   public scanInMemory(filePath: string, content: string): ScanReport {
-    this.project.createSourceFile(filePath, content, { overwrite: true });
-    return this.scanFiles([filePath]);
+    const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(this.projectRoot, filePath);
+    this.project.createSourceFile(absolutePath, content, { overwrite: true });
+    return this.scanFiles([absolutePath], false);
+  }
+
+  private getSource(filePath: string): { sourceFile: SourceFile; content: string; diskBacked: boolean } {
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const sourceFile = this.project.createSourceFile(filePath, content, { overwrite: true });
+      return { sourceFile, content, diskBacked: true };
+    }
+    const existing = this.project.getSourceFile(filePath);
+    if (!existing) throw new Error(`Source file not found: ${filePath}`);
+    return { sourceFile: existing, content: existing.getFullText(), diskBacked: false };
   }
 
   public scanFiles(files: string[], useCache = true): ScanReport {
     const findings: Finding[] = [];
     let suppressionsTotal = 0;
     let suppressionsWithoutReason = 0;
+    const cache = useCache ? new CacheManager(this.projectRoot, this.config) : null;
+    const sortedFiles = [...new Set(files.map(file => path.resolve(file)))].sort();
 
-    const cacheManager = useCache ? new CacheManager(this.projectRoot) : null;
-
-    for (const filePath of files) {
+    for (const filePath of sortedFiles) {
       const relativePath = path.relative(this.projectRoot, filePath).replace(/\\/g, '/');
-
-      let stat: fs.Stats | null = null;
-      if (cacheManager) {
-        try {
-          stat = fs.statSync(filePath);
-          const cached = cacheManager.getEntry(relativePath, stat.mtimeMs);
-          if (cached) {
-            findings.push(...cached.findings);
-            suppressionsTotal += cached.suppressions.totalCount;
-            suppressionsWithoutReason += cached.suppressions.withoutReasonCount;
-            continue;
-          }
-        } catch (e: any) {
-          if (e.code !== 'ENOENT') {
-            console.error('STAT_ERROR:', e.message, filePath);
-          }
-        }
+      const source = this.getSource(filePath);
+      const contentDigest = hashContent(source.content);
+      const cached = cache?.getEntry(relativePath, contentDigest);
+      if (cached) {
+        findings.push(...cached.findings);
+        suppressionsTotal += cached.suppressions.totalCount;
+        suppressionsWithoutReason += cached.suppressions.withoutReasonCount;
+        if (source.diskBacked) this.project.removeSourceFile(source.sourceFile);
+        continue;
       }
 
-      let sourceFile = this.project.getSourceFile(filePath);
-      if (!sourceFile) {
-        sourceFile = this.project.addSourceFileAtPath(filePath);
-      }
-      const content = sourceFile.getFullText();
-
-      const fileSup = parseSuppressions(content);
-      suppressionsTotal += fileSup.totalCount;
-      suppressionsWithoutReason += fileSup.withoutReasonCount;
-
+      const sourceFile = source.sourceFile;
+      const fileSuppressions = parseSuppressions(source.content);
+      suppressionsTotal += fileSuppressions.totalCount;
+      suppressionsWithoutReason += fileSuppressions.withoutReasonCount;
       const startIndex = findings.length;
 
-      // 1. Direct JSX Text
-      const jsxTexts = sourceFile.getDescendantsOfKind(SyntaxKind.JsxText);
-      for (const jsxText of jsxTexts) {
+      for (const jsxText of sourceFile.getDescendantsOfKind(SyntaxKind.JsxText)) {
         const parent = jsxText.getParent();
-        let elementName = 'JSXElement';
-        if (parent && (Node.isJsxElement(parent) || Node.isJsxSelfClosingElement(parent))) {
-          const tagNode = Node.isJsxElement(parent)
-            ? parent.getOpeningElement().getTagNameNode()
-            : parent.getTagNameNode();
-          elementName = tagNode.getText();
-        }
-
-        const traced: TracedValue = {
-          type: 'string',
-          value: jsxText.getText(),
-          node: jsxText
-        };
-
-        const f = this.buildFinding(
+        if (!parent || (!Node.isJsxElement(parent) && !Node.isJsxFragment(parent))) continue;
+        const elementName = Node.isJsxElement(parent) ? parent.getOpeningElement().getTagNameNode().getText() : 'Fragment';
+        const finding = this.buildFinding(
           jsxText,
-          traced,
+          { type: 'string', value: jsxText.getText(), node: jsxText },
           'JSXText',
           'high',
           `Direct JSX text inside ${elementName}`,
           { type: 'JSXText', elementName },
           relativePath,
-          fileSup
+          fileSuppressions
         );
-        if (f) findings.push(f);
+        if (finding) findings.push(finding);
       }
 
-      // 1b. JSX Expression Text (e.g. <h1>{title}</h1> where title is a local constant)
-      const jsxExprs = sourceFile.getDescendantsOfKind(SyntaxKind.JsxExpression);
-      for (const jsxExpr of jsxExprs) {
-        const parent = jsxExpr.getParent();
-        if (parent && (Node.isJsxElement(parent) || Node.isJsxSelfClosingElement(parent))) {
-          const inner = jsxExpr.getExpression();
-          if (inner) {
-            const resolved = this.resolveExpression(inner);
-            if (resolved.type === 'unknown' || resolved.type === 'object') continue;
-
-            const tagNode = Node.isJsxElement(parent)
-              ? parent.getOpeningElement().getTagNameNode()
-              : parent.getTagNameNode();
-            const elementName = tagNode.getText();
-
-            const f = this.buildFinding(
-              inner,
-              resolved,
-              'JSXText',
-              'high',
-              `JSX expression text inside ${elementName}`,
-              { type: 'JSXText', elementName },
-              relativePath,
-              fileSup
-            );
-            if (f) findings.push(f);
-          }
-        }
+      for (const jsxExpression of sourceFile.getDescendantsOfKind(SyntaxKind.JsxExpression)) {
+        const parent = jsxExpression.getParent();
+        if (!parent || (!Node.isJsxElement(parent) && !Node.isJsxFragment(parent))) continue;
+        const expression = jsxExpression.getExpression();
+        if (!expression) continue;
+        const resolved = this.resolveExpression(expression);
+        if (resolved.type === 'unknown' || resolved.type === 'object') continue;
+        const elementName = Node.isJsxElement(parent) ? parent.getOpeningElement().getTagNameNode().getText() : 'Fragment';
+        const finding = this.buildFinding(
+          expression,
+          resolved,
+          'JSXText',
+          'high',
+          `JSX expression text inside ${elementName}`,
+          { type: 'JSXText', elementName },
+          relativePath,
+          fileSuppressions
+        );
+        if (finding) findings.push(finding);
       }
 
-      // 2. JSX Attributes (including component props)
-      const jsxAttrs = sourceFile.getDescendantsOfKind(SyntaxKind.JsxAttribute);
-      for (const attr of jsxAttrs) {
-        const propName = attr.getNameNode().getText();
-        const parentElement = attr.getParent()?.getParent();
+      for (const attribute of sourceFile.getDescendantsOfKind(SyntaxKind.JsxAttribute)) {
+        const propName = attribute.getNameNode().getText();
+        const parentElement = attribute.getParent()?.getParent();
         let elementName = 'unknown';
         if (parentElement && (Node.isJsxElement(parentElement) || Node.isJsxSelfClosingElement(parentElement))) {
           const tagNode = Node.isJsxElement(parentElement)
@@ -671,287 +613,209 @@ export class Scanner {
           elementName = tagNode.getText();
         }
 
-        const isKnownComponent = elementName in this.config.checkedComponentProps;
-        const isKnownProp = isKnownComponent && this.config.checkedComponentProps[elementName].includes(propName);
-        const isCheckedAttr = this.config.checkedAttributes.includes(propName);
-        const isIgnoredAttr = this.config.ignoredAttributes.includes(propName);
+        const knownComponent = elementName in this.config.checkedComponentProps;
+        const knownProp = knownComponent && this.config.checkedComponentProps[elementName].includes(propName);
+        const checkedAttribute = this.config.checkedAttributes.includes(propName);
+        if (this.config.ignoredAttributes.includes(propName) || (!knownProp && !checkedAttribute)) continue;
 
-        if (isIgnoredAttr) continue;
-        if (!isKnownProp && !isCheckedAttr) continue;
-
-        const initializer = attr.getInitializer();
+        const initializer = attribute.getInitializer();
         if (!initializer) continue;
-
-        let expr: Node = initializer;
-        if (Node.isJsxExpression(initializer)) {
-          const innerExpr = initializer.getExpression();
-          if (innerExpr) expr = innerExpr;
-        }
-
-        const resolved = this.resolveExpression(expr);
+        let expression: Node = initializer;
+        if (Node.isJsxExpression(initializer) && initializer.getExpression()) expression = initializer.getExpression()!;
+        const resolved = this.resolveExpression(expression);
         if (resolved.type === 'unknown' || resolved.type === 'object') continue;
 
-        const kind: FindingKind = isKnownProp ? 'KnownComponentProp' : 'JSXAttribute';
-        const confidence: Confidence = isKnownProp
-          ? 'high'
-          : elementName[0] === elementName[0].toLowerCase()
-          ? 'high'
-          : 'medium'; // Custom component with generic user-facing prop name
-
-        const reason = isKnownProp
-          ? `Known component prop '${propName}' of ${elementName}`
-          : `JSX attribute '${propName}' of ${elementName}`;
-
-        const f = this.buildFinding(
-          expr,
+        const kind: FindingKind = knownProp ? 'KnownComponentProp' : 'JSXAttribute';
+        const confidence: Confidence = knownProp || /^[a-z]/.test(elementName) ? 'high' : 'medium';
+        const finding = this.buildFinding(
+          expression,
           resolved,
           kind,
           confidence,
-          reason,
+          knownProp ? `Known component prop '${propName}' of ${elementName}` : `JSX attribute '${propName}' of ${elementName}`,
           { type: 'JSXAttribute', elementName, propName },
           relativePath,
-          fileSup
+          fileSuppressions
         );
-        if (f) findings.push(f);
+        if (finding) findings.push(finding);
       }
 
-      // 3. JSX Spread Attributes
-      const spreads = sourceFile.getDescendantsOfKind(SyntaxKind.JsxSpreadAttribute);
-      for (const spread of spreads) {
-        const parentElement = spread.getParent()?.getParent();
-        let elementName = 'unknown';
-        if (parentElement && (Node.isJsxElement(parentElement) || Node.isJsxSelfClosingElement(parentElement))) {
-          const tagNode = Node.isJsxElement(parentElement)
-            ? parentElement.getOpeningElement().getTagNameNode()
-            : parentElement.getTagNameNode();
-          elementName = tagNode.getText();
-        }
+      if (this.config.features.sameFileObjects) {
+        for (const spread of sourceFile.getDescendantsOfKind(SyntaxKind.JsxSpreadAttribute)) {
+          const parentElement = spread.getParent()?.getParent();
+          let elementName = 'unknown';
+          if (parentElement && (Node.isJsxElement(parentElement) || Node.isJsxSelfClosingElement(parentElement))) {
+            const tagNode = Node.isJsxElement(parentElement)
+              ? parentElement.getOpeningElement().getTagNameNode()
+              : parentElement.getTagNameNode();
+            elementName = tagNode.getText();
+          }
+          const resolved = this.resolveExpression(spread.getExpression());
+          if (resolved.type !== 'object' || !resolved.properties) continue;
 
-        const expr = spread.getExpression();
-        const resolved = this.resolveExpression(expr);
-        if (resolved.type === 'object' && resolved.properties) {
-          for (const [propName, propVal] of Object.entries(resolved.properties)) {
-            const isKnownComponent = elementName in this.config.checkedComponentProps;
-            const isKnownProp = isKnownComponent && this.config.checkedComponentProps[elementName].includes(propName);
-            const isCheckedObjKey = this.config.checkedObjectKeys.includes(propName);
-            const isIgnoredObjKey = this.config.ignoredObjectKeys.includes(propName);
-
-            if (isIgnoredObjKey) continue;
-            if (!isKnownProp && !isCheckedObjKey) continue;
-
-            const kind: FindingKind = 'LocalObjectPropertyUsedInUserFacingContext';
-            const confidence: Confidence = isKnownProp ? 'high' : 'medium';
-            const reason = isKnownProp
-              ? `Object property '${propName}' spread into known component ${elementName}`
-              : `Object property '${propName}' spread into component ${elementName}`;
-
-            const f = this.buildFinding(
-              propVal.node,
-              propVal,
-              kind,
-              confidence,
-              reason,
+          for (const [propName, propValue] of Object.entries(resolved.properties)) {
+            const knownComponent = elementName in this.config.checkedComponentProps;
+            const knownProp = knownComponent && this.config.checkedComponentProps[elementName].includes(propName);
+            if (this.config.ignoredObjectKeys.includes(propName)) continue;
+            if (!knownProp && !this.config.checkedObjectKeys.includes(propName)) continue;
+            const finding = this.buildFinding(
+              propValue.node,
+              propValue,
+              'LocalObjectPropertyUsedInUserFacingContext',
+              knownProp ? 'high' : 'medium',
+              knownProp
+                ? `Object property '${propName}' spread into known component ${elementName}`
+                : `Object property '${propName}' spread into component ${elementName}`,
               { type: 'JSXAttribute', elementName, propName },
               relativePath,
-              fileSup
+              fileSuppressions
             );
-            if (f) findings.push(f);
+            if (finding) findings.push(finding);
           }
         }
       }
 
-      // 4. Known Function Arguments
-      const calls = sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression);
-      for (const call of calls) {
-        const expression = call.getExpression();
-        const funcName = expression.getText().replace(/\s+/g, '');
-
-        let argIndices: number[] | null = null;
-        if (Array.isArray(this.config.checkedFunctions)) {
-          if ((this.config.checkedFunctions as string[]).includes(funcName)) {
-            argIndices = [0];
-          }
-        } else if (this.config.checkedFunctions && typeof this.config.checkedFunctions === 'object') {
-          if (funcName in this.config.checkedFunctions) {
-            argIndices = (this.config.checkedFunctions as Record<string, number[]>)[funcName];
-          }
-        }
-
+      for (const call of sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        const functionName = call.getExpression().getText().replace(/\s+/g, '');
+        const argIndices = this.config.checkedFunctions[functionName];
         if (!argIndices) continue;
-
         const args = call.getArguments();
         for (const index of argIndices) {
-          if (index < args.length) {
-            const arg = args[index];
-            const resolved = this.resolveExpression(arg);
-            if (resolved.type === 'unknown' || resolved.type === 'object') continue;
-
-            const f = this.buildFinding(
-              arg,
-              resolved,
-              'KnownFunctionArgument',
-              'high',
-              `Argument index ${index} of function call ${funcName}`,
-              { type: 'CallExpression', functionName: funcName, argumentIndex: index },
-              relativePath,
-              fileSup
-            );
-            if (f) findings.push(f);
-          }
+          if (index >= args.length) continue;
+          const arg = args[index];
+          const resolved = this.resolveExpression(arg);
+          if (resolved.type === 'unknown' || resolved.type === 'object') continue;
+          const finding = this.buildFinding(
+            arg,
+            resolved,
+            'KnownFunctionArgument',
+            'high',
+            `Argument index ${index} of function call ${functionName}`,
+            { type: 'CallExpression', functionName, argumentIndex: index },
+            relativePath,
+            fileSuppressions
+          );
+          if (finding) findings.push(finding);
         }
       }
 
-      // 5. UI Config Arrays
-      const vars = sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration);
-      for (const variable of vars) {
-        const varName = variable.getName();
-        const typeNode = variable.getTypeNode();
-        const typeName = typeNode ? typeNode.getText() : '';
+      if (this.config.features.sameFileObjects) {
+        for (const variable of sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+          const variableName = variable.getName();
+          const typeName = variable.getTypeNode()?.getText() ?? '';
+          const initializer = variable.getInitializer();
+          if (!initializer || !Node.isArrayLiteralExpression(initializer)) continue;
+          const recognizedUiConfig =
+            this.config.uiConfigVariables?.includes(variableName) || this.config.uiConfigTypes?.includes(typeName);
 
-        const isUiConfigVar = this.config.uiConfigVariables?.includes(varName);
-        const isUiConfigType = this.config.uiConfigTypes?.includes(typeName);
-
-        const initializer = variable.getInitializer();
-        if (initializer && Node.isArrayLiteralExpression(initializer)) {
-          // Check all objects in the array
           for (const element of initializer.getElements()) {
             const resolved = this.resolveExpression(element);
-            if (resolved.type === 'object' && resolved.properties) {
-              for (const [propName, propVal] of Object.entries(resolved.properties)) {
-                const isCheckedObjKey = this.config.checkedObjectKeys.includes(propName);
-                const isIgnoredObjKey = this.config.ignoredObjectKeys.includes(propName);
-
-                if (isIgnoredObjKey) continue;
-                if (isCheckedObjKey) {
-                  const confidence: Confidence = (isUiConfigVar || isUiConfigType) ? 'high' : 'medium';
-                  const kind: FindingKind = 'LocalObjectPropertyUsedInUserFacingContext';
-                  const reason = `UI configuration object property '${propName}' in array '${varName}'`;
-
-                  const f = this.buildFinding(
-                    propVal.node,
-                    propVal,
-                    kind,
-                    confidence,
-                    reason,
-                    { type: 'VariableDeclaration', variableName: varName, propName },
-                    relativePath,
-                    fileSup
-                  );
-                  if (f) findings.push(f);
-                }
-              }
+            if (resolved.type !== 'object' || !resolved.properties) continue;
+            for (const [propName, propValue] of Object.entries(resolved.properties)) {
+              if (this.config.ignoredObjectKeys.includes(propName) || !this.config.checkedObjectKeys.includes(propName)) continue;
+              const finding = this.buildFinding(
+                propValue.node,
+                propValue,
+                'LocalObjectPropertyUsedInUserFacingContext',
+                recognizedUiConfig ? 'high' : 'medium',
+                `UI configuration object property '${propName}' in array '${variableName}'`,
+                { type: 'VariableDeclaration', variableName, propName },
+                relativePath,
+                fileSuppressions
+              );
+              if (finding) findings.push(finding);
             }
           }
         }
       }
 
-      // 6. Errors & Exceptions
       if (this.config.scanErrors !== false) {
-        const throws = sourceFile.getDescendantsOfKind(SyntaxKind.ThrowStatement);
-        for (const thr of throws) {
-          const expr = thr.getExpression();
-          if (expr && Node.isNewExpression(expr)) {
-            const classExpr = expr.getExpression();
-            if (classExpr.getText() === 'Error') {
-              const args = expr.getArguments();
-              if (args.length > 0) {
-                const resolved = this.resolveExpression(args[0]);
-                if (resolved.type === 'string') {
-                  const f = this.buildFinding(
-                    args[0],
-                    resolved,
-                    'ErrorString',
-                    'low',
-                    'Exception error message',
-                    { type: 'ThrowStatement' },
-                    relativePath,
-                    fileSup
-                  );
-                  if (f) findings.push(f);
-                }
-              }
-            }
-          }
+        for (const statement of sourceFile.getDescendantsOfKind(SyntaxKind.ThrowStatement)) {
+          const expression = statement.getExpression();
+          if (!expression || !Node.isNewExpression(expression) || expression.getExpression().getText() !== 'Error') continue;
+          const firstArg = expression.getArguments()[0];
+          if (!firstArg) continue;
+          const resolved = this.resolveExpression(firstArg);
+          if (resolved.type !== 'string') continue;
+          const finding = this.buildFinding(
+            firstArg,
+            resolved,
+            'ErrorString',
+            'low',
+            'Exception error message',
+            { type: 'ThrowStatement' },
+            relativePath,
+            fileSuppressions
+          );
+          if (finding) findings.push(finding);
         }
       }
+
       const fileFindings = findings.slice(startIndex);
-      if (cacheManager && stat) {
-        cacheManager.setEntry(
-          relativePath,
-          stat.mtimeMs,
-          fileFindings,
-          { totalCount: fileSup.totalCount, withoutReasonCount: fileSup.withoutReasonCount }
-        );
-      }
+      cache?.setEntry(relativePath, contentDigest, fileFindings, {
+        totalCount: fileSuppressions.totalCount,
+        withoutReasonCount: fileSuppressions.withoutReasonCount
+      });
+      if (source.diskBacked) this.project.removeSourceFile(sourceFile);
     }
 
-    if (cacheManager) {
-      cacheManager.save();
-    }
+    cache?.save();
+    findings.sort((a, b) => a.filePath.localeCompare(b.filePath) || a.line - b.line || a.column - b.column || a.kind.localeCompare(b.kind));
 
-    // Post-process to group duplicates and format summary
+    const active = findings.filter(finding => finding.confidence !== 'ignored');
+    const filesWithFindings = new Set(active.map(finding => finding.filePath));
     const summary: ScanSummary = {
-      filesScanned: files.length,
-      filesWithFindings: 0,
-      totalFindings: 0,
-      highConfidence: 0,
-      mediumConfidence: 0,
-      lowConfidence: 0,
-      autoFixCandidates: 0,
-      needsReview: 0
+      filesScanned: sortedFiles.length,
+      filesWithFindings: filesWithFindings.size,
+      totalFindings: active.length,
+      highConfidence: active.filter(finding => finding.confidence === 'high').length,
+      mediumConfidence: active.filter(finding => finding.confidence === 'medium').length,
+      lowConfidence: active.filter(finding => finding.confidence === 'low').length,
+      autoFixCandidates: active.filter(finding => finding.autoFixCandidate).length,
+      needsReview: active.filter(finding => finding.needsReview).length
     };
 
-    const filesWithFindingsSet = new Set<string>();
-
-    // Count findings by confidence and fix candidacy
-    for (const f of findings) {
-      if (f.confidence !== 'ignored') {
-        filesWithFindingsSet.add(f.filePath);
-        summary.totalFindings++;
-        if (f.confidence === 'high') summary.highConfidence++;
-        else if (f.confidence === 'medium') summary.mediumConfidence++;
-        else if (f.confidence === 'low') summary.lowConfidence++;
-
-        if (f.autoFixCandidate) summary.autoFixCandidates++;
-        if (f.needsReview) summary.needsReview++;
-      }
-    }
-    summary.filesWithFindings = filesWithFindingsSet.size;
-
     return {
-      schemaVersion: '1.0',
+      schemaVersion: REPORT_SCHEMA_VERSION,
       generatedAt: new Date().toISOString(),
       projectRoot: this.projectRoot,
       summary,
-      suppressions: {
-        total: suppressionsTotal,
-        withoutReason: suppressionsWithoutReason
-      },
+      suppressions: { total: suppressionsTotal, withoutReason: suppressionsWithoutReason },
       findings
     };
   }
 
   public async getTargetFiles(): Promise<string[]> {
-    const excludes = [...this.config.exclude];
-    const gitignorePath = path.join(this.projectRoot, '.gitignore');
-    if (fs.existsSync(gitignorePath)) {
-      const gitignore = fs.readFileSync(gitignorePath, 'utf8');
-      const rules = gitignore.split(/\r?\n/)
-        .map(l => l.trim())
-        .filter(l => l && !l.startsWith('#'))
-        .map(l => {
-          if (l.endsWith('/')) l = l.slice(0, -1);
-          return l.startsWith('/') ? l.slice(1) : `**/${l}`;
-        });
-      excludes.push(...rules);
-    }
-
-    const files = await fg(this.config.include, {
-      ignore: excludes,
+    const candidates = await fg(this.config.include, {
+      ignore: this.config.exclude,
       absolute: true,
-      cwd: this.projectRoot
+      cwd: this.projectRoot,
+      onlyFiles: true,
+      unique: true
     });
 
-    return files;
+    try {
+      const insideGit = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+        cwd: this.projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      }).trim();
+      if (insideGit !== 'true') return candidates.sort();
+
+      const output = execFileSync('git', ['ls-files', '-co', '--exclude-standard', '-z', '--'], {
+        cwd: this.projectRoot,
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024
+      });
+      const allowed = new Set(
+        output
+          .split('\0')
+          .filter(Boolean)
+          .map(file => path.resolve(this.projectRoot, file))
+      );
+      return candidates.filter(file => allowed.has(path.resolve(file))).sort();
+    } catch {
+      return candidates.sort();
+    }
   }
 }

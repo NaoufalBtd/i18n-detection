@@ -5,3 +5,5 @@ export * from './reporter.js';
 export * from './extractor.js';
 export * from './codemod.js';
 export * from './cache.js';
+export * from './io.js';
+export * from './version.js';

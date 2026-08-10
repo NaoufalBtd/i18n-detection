@@ -13,6 +13,9 @@ export type FindingKind =
   | 'ErrorString'
   | 'AmbiguousString';
 
+export type Fixability = 'safe' | 'review' | 'unsupported';
+export type FixStrategy = 'replace-jsx-text' | 'replace-jsx-attribute';
+
 export interface UserFacingContext {
   type: string;
   elementName?: string;
@@ -24,6 +27,7 @@ export interface UserFacingContext {
 
 export interface Finding {
   id: string;
+  fingerprint: string;
   filePath: string;
   line: number;
   column: number;
@@ -31,7 +35,7 @@ export interface Finding {
   endColumn: number;
   rawText?: string;
   normalizedText?: string;
-  texts?: string[]; // Used for conditional strings containing multiple source choices
+  texts?: string[];
   kind: FindingKind;
   confidence: Confidence;
   reason: string;
@@ -41,11 +45,12 @@ export interface Finding {
   existingSimilarKey?: string | null;
   duplicateGroupId?: string;
   autoFixCandidate: boolean;
+  fixability: Fixability;
+  fixStrategy?: FixStrategy;
   needsReview: boolean;
   tags?: string[];
   variableName?: string;
   propertyName?: string;
-  // For LocalConst/LocalObject: declaration and usage locations
   declarationLocation?: {
     file: string;
     line: number;
@@ -57,13 +62,17 @@ export interface Finding {
     column: number;
   };
   variables?: string[];
+  interpolationExpressions?: Record<string, string>;
 }
+
+export type CodemodFramework = 'next-intl' | 'react-i18next' | 'generic';
 
 export interface ScannerConfig {
   include: string[];
   exclude: string[];
   i18n: {
     library: string;
+    sourceLocale: string;
     translationFunctionName: string;
     clientHook: string;
     serverAsyncFunction: string;
@@ -94,8 +103,7 @@ export interface ScannerConfig {
     insertServerTranslations: boolean;
   };
   codemod?: {
-    importStatement?: string;
-    hookStatement?: string;
+    framework?: CodemodFramework;
   };
 }
 
