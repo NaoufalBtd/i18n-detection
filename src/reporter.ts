@@ -14,6 +14,12 @@ function ruleId(kind: FindingKind): string {
     ConditionalStringUsedInUserFacingContext: 'i18n/conditional-string',
     TemplateLiteralUsedInUserFacingContext: 'i18n/template-literal',
     StringConcatenationUsedInUserFacingContext: 'i18n/string-concatenation',
+    TranslationFallback: 'i18n/translation-fallback',
+    TranslationDefaultValue: 'i18n/translation-default-value',
+    PresentationObjectString: 'i18n/presentation-object-string',
+    InlineLocaleCatalogString: 'i18n/inline-locale-catalog',
+    ValidationMessage: 'i18n/validation-message',
+    NextMetadataString: 'i18n/next-metadata-string',
     ErrorString: 'i18n/error-string',
     AmbiguousString: 'i18n/ambiguous-string'
   };
@@ -81,8 +87,8 @@ export class Reporter {
     const active = this.report.findings.filter(finding => finding.confidence !== 'ignored');
     const rules = [...new Set(active.map(finding => ruleId(finding.kind)))].sort().map(id => ({
       id,
-      shortDescription: { text: 'Hardcoded user-facing string' },
-      fullDescription: { text: 'User-facing strings should be localized using the configured i18n framework.' },
+      shortDescription: { text: 'Hardcoded or embedded user-facing source string' },
+      fullDescription: { text: 'User-facing source copy should follow the configured i18n policy and catalog architecture.' },
       helpUri: 'https://github.com/NaoufalBtd/i18n-detection'
     }));
 
