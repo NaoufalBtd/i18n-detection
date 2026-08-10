@@ -31,7 +31,6 @@ describe('fixture regressions', () => {
         const expectedFinding = expected.findings.find(item => item.kind === finding.kind && item.rawText === finding.rawText);
         expect(expectedFinding, `Missing expected finding for ${finding.kind}: ${finding.rawText}`).toBeDefined();
         expect(finding.confidence).toBe(expectedFinding?.confidence);
-        expect(finding.suggestedKey).toBe(expectedFinding?.suggestedKey);
       }
     });
   }

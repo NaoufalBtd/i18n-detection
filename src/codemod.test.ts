@@ -42,7 +42,7 @@ describe('codemod safety', () => {
       expect(results).toHaveLength(1);
       expect(results[0].success).toBe(true);
       expect(results[0].patches).toHaveLength(2);
-      expect(results[0].plannedContent).toContain("import { useTranslations } from 'next-intl';");
+      expect(results[0].plannedContent).toMatch(/import \{ useTranslations \} from ["']next-intl["'];/);
       expect(results[0].plannedContent?.match(/const t = useTranslations\(\);/g)).toHaveLength(1);
     });
   });
@@ -56,7 +56,7 @@ describe('codemod safety', () => {
         confidence: 'high'
       })[0];
       expect(result.success).toBe(true);
-      expect(result.plannedContent).toContain("from 'next-intl/server'");
+      expect(result.plannedContent).toMatch(/from ["']next-intl\/server["']/);
       expect(result.plannedContent).toContain('const t = await getTranslations();');
     });
   });

@@ -19,6 +19,7 @@ describe('scanner', () => {
     const active = report.findings.filter(finding => finding.confidence !== 'ignored');
     expect(active.map(finding => finding.rawText)).toEqual(['Account settings', 'Search users']);
     expect(active.every(finding => finding.autoFixCandidate)).toBe(true);
+    expect(active.find(finding => finding.rawText === 'Account settings')?.suggestedKey).toBe('test.component.accountSettings');
   });
 
   it('does not classify traced constants as safe auto-fixes', () => {
