@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG: ScannerConfig = {
     clientHook: 'useTranslations',
     serverAsyncFunction: 'getTranslations',
     messagesPath: 'messages/{locale}.json',
+    catalogRoutes: [],
     catalogFormat: 'nested-json',
     keyStyle: 'namespace.dot.camelCase'
   },
@@ -249,6 +250,7 @@ function validateRawConfig(raw: Record<string, unknown>): void {
       'clientHook',
       'serverAsyncFunction',
       'messagesPath',
+      'catalogRoutes',
       'catalogFormat',
       'keyStyle'
     ]),
@@ -313,6 +315,32 @@ function validateConfig(config: ScannerConfig): void {
     }
     if (config.i18n.keyStyle !== 'namespace.dot.camelCase') {
       errors.push('i18n.keyStyle currently supports only namespace.dot.camelCase');
+    }
+    if (config.i18n.catalogRoutes !== undefined) {
+      if (!Array.isArray(config.i18n.catalogRoutes)) {
+        errors.push('i18n.catalogRoutes must be an array');
+      } else {
+        const namespaces = new Set<string>();
+        for (const [index, route] of config.i18n.catalogRoutes.entries()) {
+          if (!isRecord(route)) {
+            errors.push(`i18n.catalogRoutes.${index} must be an object`);
+            continue;
+          }
+          if (typeof route.namespace !== 'string' || route.namespace.trim() === '') {
+            errors.push(`i18n.catalogRoutes.${index}.namespace must be a non-empty string`);
+          } else if (namespaces.has(route.namespace)) {
+            errors.push(`i18n.catalogRoutes contains duplicate namespace '${route.namespace}'`);
+          } else {
+            namespaces.add(route.namespace);
+          }
+          if (typeof route.messagesPath !== 'string' || route.messagesPath.trim() === '') {
+            errors.push(`i18n.catalogRoutes.${index}.messagesPath must be a non-empty string`);
+          }
+          if (route.stripNamespace !== undefined && typeof route.stripNamespace !== 'boolean') {
+            errors.push(`i18n.catalogRoutes.${index}.stripNamespace must be boolean`);
+          }
+        }
+      }
     }
   }
 
