@@ -187,15 +187,42 @@ function validateSyntax(filePath: string, content: string): string | undefined {
   return errors.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')).join('; ');
 }
 
+function diagnosticMessage(diagnostic: Diagnostic): string {
+  return ts.flattenDiagnosticMessageText(diagnostic.compilerObject.messageText, '\n');
+}
+
 function diagnosticIdentity(diagnostic: Diagnostic): string {
   const source = diagnostic.getSourceFile();
-  const file = source?.getFilePath() ?? '';
   return JSON.stringify({
     code: diagnostic.getCode(),
-    file,
-    start: diagnostic.getStart(),
-    message: diagnostic.getMessageText().toString()
+    file: source?.getFilePath() ?? '',
+    message: diagnosticMessage(diagnostic)
   });
+}
+
+function diagnosticCounts(diagnostics: Diagnostic[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const diagnostic of diagnostics) {
+    const identity = diagnosticIdentity(diagnostic);
+    counts.set(identity, (counts.get(identity) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function newlyIntroducedDiagnostics(before: Map<string, number>, after: Diagnostic[]): Diagnostic[] {
+  const remaining = new Map(before);
+  const introduced: Diagnostic[] = [];
+  for (const diagnostic of after) {
+    const identity = diagnosticIdentity(diagnostic);
+    const count = remaining.get(identity) ?? 0;
+    if (count > 0) {
+      if (count === 1) remaining.delete(identity);
+      else remaining.set(identity, count - 1);
+    } else {
+      introduced.push(diagnostic);
+    }
+  }
+  return introduced;
 }
 
 function diagnosticsForFile(project: Project, filePath: string): Diagnostic[] {
@@ -223,14 +250,11 @@ function validateProjectChanges(
       throw new Error(`Configured tsconfig was not found: ${resolvedTsconfig}`);
     }
     const project = new Project({ tsConfigFilePath: resolvedTsconfig });
-    const baseline = new Map<string, Set<string>>();
+    const baseline = new Map<string, Map<string, number>>();
 
     for (const result of modified) {
       const absoluteFile = path.resolve(projectRoot, result.filePath);
-      baseline.set(
-        result.filePath,
-        new Set(diagnosticsForFile(project, absoluteFile).map(diagnosticIdentity))
-      );
+      baseline.set(result.filePath, diagnosticCounts(diagnosticsForFile(project, absoluteFile)));
     }
 
     for (const result of modified) {
@@ -240,9 +264,10 @@ function validateProjectChanges(
 
     for (const result of modified) {
       const absoluteFile = path.resolve(projectRoot, result.filePath);
-      const previous = baseline.get(result.filePath) ?? new Set<string>();
-      const introduced = diagnosticsForFile(project, absoluteFile)
-        .filter(diagnostic => !previous.has(diagnosticIdentity(diagnostic)));
+      const introduced = newlyIntroducedDiagnostics(
+        baseline.get(result.filePath) ?? new Map<string, number>(),
+        diagnosticsForFile(project, absoluteFile)
+      );
       if (introduced.length === 0) continue;
 
       result.success = false;
@@ -250,7 +275,7 @@ function validateProjectChanges(
       result.plannedContent = undefined;
       result.error = `Project TypeScript validation introduced ${introduced.length} diagnostic(s): ${introduced
         .slice(0, 5)
-        .map(diagnostic => `${diagnostic.getCode()}: ${diagnostic.getMessageText().toString()}`)
+        .map(diagnostic => `${diagnostic.getCode()}: ${diagnosticMessage(diagnostic)}`)
         .join('; ')}`;
     }
   } catch (error) {
