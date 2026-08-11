@@ -225,12 +225,24 @@ function newlyIntroducedDiagnostics(before: Map<string, number>, after: Diagnost
   return introduced;
 }
 
-function diagnosticsForFile(project: Project, filePath: string): Diagnostic[] {
-  const absolute = path.resolve(filePath);
-  return project.getPreEmitDiagnostics().filter(diagnostic => {
+function projectDiagnosticsByResult(
+  project: Project,
+  projectRoot: string,
+  results: CodemodResult[]
+): Map<string, Diagnostic[]> {
+  const resultByAbsolutePath = new Map(
+    results.map(result => [path.resolve(projectRoot, result.filePath), result.filePath] as const)
+  );
+  const grouped = new Map(results.map(result => [result.filePath, [] as Diagnostic[]] as const));
+
+  for (const diagnostic of project.getPreEmitDiagnostics()) {
     const source = diagnostic.getSourceFile();
-    return source ? path.resolve(source.getFilePath()) === absolute : false;
-  });
+    if (!source) continue;
+    const resultPath = resultByAbsolutePath.get(path.resolve(source.getFilePath()));
+    if (!resultPath) continue;
+    grouped.get(resultPath)!.push(diagnostic);
+  }
+  return grouped;
 }
 
 function validateProjectChanges(
@@ -250,23 +262,24 @@ function validateProjectChanges(
       throw new Error(`Configured tsconfig was not found: ${resolvedTsconfig}`);
     }
     const project = new Project({ tsConfigFilePath: resolvedTsconfig });
-    const baseline = new Map<string, Map<string, number>>();
-
-    for (const result of modified) {
-      const absoluteFile = path.resolve(projectRoot, result.filePath);
-      baseline.set(result.filePath, diagnosticCounts(diagnosticsForFile(project, absoluteFile)));
-    }
+    const baselineDiagnostics = projectDiagnosticsByResult(project, projectRoot, modified);
+    const baseline = new Map(
+      modified.map(result => [
+        result.filePath,
+        diagnosticCounts(baselineDiagnostics.get(result.filePath) ?? [])
+      ] as const)
+    );
 
     for (const result of modified) {
       const absoluteFile = path.resolve(projectRoot, result.filePath);
       project.createSourceFile(absoluteFile, result.plannedContent!, { overwrite: true });
     }
 
+    const plannedDiagnostics = projectDiagnosticsByResult(project, projectRoot, modified);
     for (const result of modified) {
-      const absoluteFile = path.resolve(projectRoot, result.filePath);
       const introduced = newlyIntroducedDiagnostics(
         baseline.get(result.filePath) ?? new Map<string, number>(),
-        diagnosticsForFile(project, absoluteFile)
+        plannedDiagnostics.get(result.filePath) ?? []
       );
       if (introduced.length === 0) continue;
 
