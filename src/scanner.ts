@@ -373,6 +373,58 @@ export class Scanner {
     return contextType === 'JSXText' || contextType === 'JSXAttribute' ? `{${call}}` : call;
   }
 
+  private textVariants(value: TracedValue): string[] {
+    if ((value.type === 'string' || value.type === 'template_literal') && value.value) return [value.value];
+    if (value.type === 'conditional' && value.texts) return value.texts;
+    return [];
+  }
+
+  private mergeConditionalObjects(
+    left: TracedValue,
+    right: TracedValue,
+    node: Node
+  ): TracedValue | undefined {
+    if (left.type !== 'object' || right.type !== 'object') return undefined;
+    const properties: Record<string, TracedValue> = {};
+    const names = new Set([
+      ...Object.keys(left.properties ?? {}),
+      ...Object.keys(right.properties ?? {})
+    ]);
+
+    for (const name of names) {
+      const leftValue = left.properties?.[name];
+      const rightValue = right.properties?.[name];
+      if (!leftValue) {
+        if (rightValue) properties[name] = rightValue;
+        continue;
+      }
+      if (!rightValue) {
+        properties[name] = leftValue;
+        continue;
+      }
+
+      const nested = this.mergeConditionalObjects(leftValue, rightValue, node);
+      if (nested) {
+        properties[name] = nested;
+        continue;
+      }
+
+      const texts = [...new Set([
+        ...this.textVariants(leftValue),
+        ...this.textVariants(rightValue)
+      ])];
+      if (texts.length > 0) {
+        properties[name] = { type: 'conditional', texts, node };
+      } else if (leftValue.type !== 'unknown') {
+        properties[name] = leftValue;
+      } else {
+        properties[name] = rightValue;
+      }
+    }
+
+    return { type: 'object', properties, node };
+  }
+
   private resolveExpression(node: Node, visited = new Set<Node>()): TracedValue {
     if (visited.has(node)) return { type: 'unknown', node };
     visited.add(node);
@@ -413,12 +465,13 @@ export class Scanner {
       ) {
         const left = this.resolveExpression(node.getLeft(), new Set(visited));
         const right = this.resolveExpression(node.getRight(), new Set(visited));
-        const texts: string[] = [];
-        for (const resolved of [left, right]) {
-          if (resolved.type === 'string' && resolved.value) texts.push(resolved.value);
-          if (resolved.type === 'conditional' && resolved.texts) texts.push(...resolved.texts);
-        }
-        if (texts.length > 0) return { type: 'conditional', texts: [...new Set(texts)], node };
+        const object = this.mergeConditionalObjects(left, right, node);
+        if (object) return object;
+        const texts = [...new Set([
+          ...this.textVariants(left),
+          ...this.textVariants(right)
+        ])];
+        if (texts.length > 0) return { type: 'conditional', texts, node };
       }
     }
 
@@ -426,12 +479,13 @@ export class Scanner {
       if (!this.config.features.conditionalStrings) return { type: 'unknown', node };
       const whenTrue = this.resolveExpression(node.getWhenTrue(), new Set(visited));
       const whenFalse = this.resolveExpression(node.getWhenFalse(), new Set(visited));
-      const texts: string[] = [];
-      if (whenTrue.type === 'string' && whenTrue.value) texts.push(whenTrue.value);
-      if (whenTrue.type === 'conditional' && whenTrue.texts) texts.push(...whenTrue.texts);
-      if (whenFalse.type === 'string' && whenFalse.value) texts.push(whenFalse.value);
-      if (whenFalse.type === 'conditional' && whenFalse.texts) texts.push(...whenFalse.texts);
-      return { type: 'conditional', texts: texts.length > 0 ? [...new Set(texts)] : undefined, node };
+      const object = this.mergeConditionalObjects(whenTrue, whenFalse, node);
+      if (object) return object;
+      const texts = [...new Set([
+        ...this.textVariants(whenTrue),
+        ...this.textVariants(whenFalse)
+      ])];
+      return { type: 'conditional', texts: texts.length > 0 ? texts : undefined, node };
     }
 
     if (Node.isIdentifier(node) && this.config.features.sameFileConstants) {
