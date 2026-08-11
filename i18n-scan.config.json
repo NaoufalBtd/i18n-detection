@@ -17,10 +17,11 @@
   ],
   "i18n": {
     "library": "next-intl",
+    "sourceLocale": "en",
     "translationFunctionName": "t",
     "clientHook": "useTranslations",
     "serverAsyncFunction": "getTranslations",
-    "messagesPath": "messages/en.json",
+    "messagesPath": "messages/{locale}.json",
     "catalogFormat": "nested-json",
     "keyStyle": "namespace.dot.camelCase"
   },
@@ -187,7 +188,10 @@
     "stringConcatenation": true,
     "crossFileConstants": false,
     "codemod": false,
-    "insertClientTranslations": false,
-    "insertServerTranslations": false
+    "insertClientTranslations": true,
+    "insertServerTranslations": true
+  },
+  "codemod": {
+    "framework": "next-intl"
   }
 }

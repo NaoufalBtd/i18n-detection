@@ -10,8 +10,17 @@ export type FindingKind =
   | 'ConditionalStringUsedInUserFacingContext'
   | 'TemplateLiteralUsedInUserFacingContext'
   | 'StringConcatenationUsedInUserFacingContext'
+  | 'TranslationFallback'
+  | 'TranslationDefaultValue'
+  | 'PresentationObjectString'
+  | 'InlineLocaleCatalogString'
+  | 'ValidationMessage'
+  | 'NextMetadataString'
   | 'ErrorString'
   | 'AmbiguousString';
+
+export type Fixability = 'safe' | 'review' | 'unsupported';
+export type FixStrategy = 'replace-jsx-text' | 'replace-jsx-attribute';
 
 export interface UserFacingContext {
   type: string;
@@ -24,6 +33,7 @@ export interface UserFacingContext {
 
 export interface Finding {
   id: string;
+  fingerprint: string;
   filePath: string;
   line: number;
   column: number;
@@ -31,7 +41,7 @@ export interface Finding {
   endColumn: number;
   rawText?: string;
   normalizedText?: string;
-  texts?: string[]; // Used for conditional strings containing multiple source choices
+  texts?: string[];
   kind: FindingKind;
   confidence: Confidence;
   reason: string;
@@ -41,11 +51,12 @@ export interface Finding {
   existingSimilarKey?: string | null;
   duplicateGroupId?: string;
   autoFixCandidate: boolean;
+  fixability: Fixability;
+  fixStrategy?: FixStrategy;
   needsReview: boolean;
   tags?: string[];
   variableName?: string;
   propertyName?: string;
-  // For LocalConst/LocalObject: declaration and usage locations
   declarationLocation?: {
     file: string;
     line: number;
@@ -57,6 +68,33 @@ export interface Finding {
     column: number;
   };
   variables?: string[];
+  interpolationExpressions?: Record<string, string>;
+}
+
+export type CodemodFramework = 'next-intl' | 'react-i18next' | 'generic';
+
+export interface CatalogRoute {
+  namespace: string;
+  messagesPath: string;
+  stripNamespace?: boolean;
+}
+
+export interface TranslationApiRule {
+  callee: string;
+  fallbackArgument?: number;
+  optionsArgument?: number;
+  defaultValueProperty?: string;
+}
+
+export interface SemanticScanConfig {
+  translationApis: TranslationApiRule[];
+  presentationFilePatterns: string[];
+  presentationFunctionPatterns: string[];
+  presentationObjectKeys: string[];
+  translationObjectVariables: string[];
+  inlineLocaleKeys: string[];
+  scanValidationMessages: boolean;
+  scanNextMetadata: boolean;
 }
 
 export interface ScannerConfig {
@@ -64,10 +102,12 @@ export interface ScannerConfig {
   exclude: string[];
   i18n: {
     library: string;
+    sourceLocale: string;
     translationFunctionName: string;
     clientHook: string;
     serverAsyncFunction: string;
     messagesPath: string;
+    catalogRoutes?: CatalogRoute[];
     catalogFormat: 'nested-json' | 'flat-json';
     keyStyle: string;
   };
@@ -82,6 +122,7 @@ export interface ScannerConfig {
   scanErrors?: boolean;
   uiConfigVariables?: string[];
   uiConfigTypes?: string[];
+  semantic?: SemanticScanConfig;
   features: {
     sameFileConstants: boolean;
     sameFileObjects: boolean;
@@ -94,8 +135,7 @@ export interface ScannerConfig {
     insertServerTranslations: boolean;
   };
   codemod?: {
-    importStatement?: string;
-    hookStatement?: string;
+    framework?: CodemodFramework;
   };
 }
 

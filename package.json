@@ -1,16 +1,36 @@
 {
   "name": "@company/i18n-scan",
-  "version": "1.0.0",
-  "description": "Enterprise i18n Hardcoded String Detector",
-  "main": "dist/index.js",
+  "version": "1.1.0",
+  "description": "Production-oriented AST detector for hardcoded user-facing strings",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "bin": {
     "i18n-scan": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NaoufalBtd/i18n-detection.git"
   },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "scan": "node dist/cli.js",
+    "check": "npm run build && npm test",
+    "scan": "node dist/cli.js scan",
     "apply": "node dist/cli.js apply"
   },
   "dependencies": {

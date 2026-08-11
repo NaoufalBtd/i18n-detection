@@ -1,9 +1,39 @@
-import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { ScanReport, Finding } from './types.js';
+import type { ScanReport, Finding, FindingKind } from './types.js';
+import { TOOL_VERSION } from './version.js';
+import { writeFilesAtomically } from './io.js';
+
+function ruleId(kind: FindingKind): string {
+  const byKind: Record<FindingKind, string> = {
+    JSXText: 'i18n/jsx-text',
+    JSXAttribute: 'i18n/jsx-attribute',
+    KnownComponentProp: 'i18n/component-prop',
+    KnownFunctionArgument: 'i18n/function-argument',
+    LocalConstUsedInUserFacingContext: 'i18n/local-constant',
+    LocalObjectPropertyUsedInUserFacingContext: 'i18n/local-object-property',
+    ConditionalStringUsedInUserFacingContext: 'i18n/conditional-string',
+    TemplateLiteralUsedInUserFacingContext: 'i18n/template-literal',
+    StringConcatenationUsedInUserFacingContext: 'i18n/string-concatenation',
+    TranslationFallback: 'i18n/translation-fallback',
+    TranslationDefaultValue: 'i18n/translation-default-value',
+    PresentationObjectString: 'i18n/presentation-object-string',
+    InlineLocaleCatalogString: 'i18n/inline-locale-catalog',
+    ValidationMessage: 'i18n/validation-message',
+    NextMetadataString: 'i18n/next-metadata-string',
+    ErrorString: 'i18n/error-string',
+    AmbiguousString: 'i18n/ambiguous-string'
+  };
+  return byKind[kind];
+}
+
+function codeFence(content: string, language: string): string {
+  const longest = Math.max(3, ...Array.from(content.matchAll(/`+/g), match => match[0].length + 1));
+  const fence = '`'.repeat(longest);
+  return `${fence}${language}\n${content}\n${fence}`;
+}
 
 export class Reporter {
-  private report: ScanReport;
+  private readonly report: ScanReport;
 
   constructor(report: ScanReport) {
     this.report = report;
@@ -14,140 +44,119 @@ export class Reporter {
   }
 
   public toMarkdown(): string {
-    const s = this.report.summary;
-    let md = `# i18n Hardcoded String Report\n\n`;
+    const summary = this.report.summary;
+    let markdown = '# i18n Hardcoded String Report\n\n';
+    markdown += '## Summary\n\n';
+    markdown += `- Files scanned: ${summary.filesScanned}\n`;
+    markdown += `- Files with findings: ${summary.filesWithFindings}\n`;
+    markdown += `- Total findings: ${summary.totalFindings}\n`;
+    markdown += `- High confidence: ${summary.highConfidence}\n`;
+    markdown += `- Medium confidence: ${summary.mediumConfidence}\n`;
+    markdown += `- Low confidence: ${summary.lowConfidence}\n`;
+    markdown += `- Safe auto-fix candidates: ${summary.autoFixCandidates}\n`;
+    markdown += `- Needs review: ${summary.needsReview}\n\n`;
 
-    md += `## Summary\n\n`;
-    md += `- Files scanned: ${s.filesScanned}\n`;
-    md += `- Files with findings: ${s.filesWithFindings}\n`;
-    md += `- Total findings: ${s.totalFindings}\n`;
-    md += `- High confidence: ${s.highConfidence}\n`;
-    md += `- Medium confidence: ${s.mediumConfidence}\n`;
-    md += `- Low confidence: ${s.lowConfidence}\n`;
-    md += `- Auto-fix candidates: ${s.autoFixCandidates}\n`;
-    md += `- Needs review: ${s.needsReview}\n\n`;
+    const active = this.report.findings.filter(finding => finding.confidence !== 'ignored');
+    const sections: [string, Finding[]][] = [
+      ['High-confidence findings', active.filter(finding => finding.confidence === 'high')],
+      ['Needs review', active.filter(finding => finding.confidence === 'medium' || finding.confidence === 'low')]
+    ];
 
-    const activeFindings = this.report.findings.filter(f => f.confidence !== 'ignored');
-
-    // 1. High-confidence findings
-    const high = activeFindings.filter(f => f.confidence === 'high');
-    if (high.length > 0) {
-      md += `## High-confidence findings\n\n`;
-      const grouped = this.groupByFile(high);
-      for (const [file, fileFindings] of Object.entries(grouped)) {
-        md += `### ${file}\n\n`;
-        for (const f of fileFindings) {
-          md += `#### Line ${f.line}\n\n`;
-          md += `Source:\n\n`;
-          md += `\`\`\`tsx\n${f.rawText || ''}\n\`\`\`\n\n`;
-          md += `Suggested key:\n\n`;
-          md += `\`\`\`txt\n${f.suggestedKey || ''}\n\`\`\`\n\n`;
-          md += `Suggested replacement:\n\n`;
-          md += `\`\`\`tsx\n${f.suggestedReplacement || ''}\n\`\`\`\n\n`;
+    for (const [title, findings] of sections) {
+      if (findings.length === 0) continue;
+      markdown += `## ${title}\n\n`;
+      for (const [file, fileFindings] of Object.entries(this.groupByFile(findings))) {
+        markdown += `### ${file}\n\n`;
+        for (const finding of fileFindings) {
+          markdown += `#### Line ${finding.line}\n\n`;
+          markdown += `${codeFence(finding.rawText ?? '', 'tsx')}\n\n`;
+          markdown += `- Rule: \`${ruleId(finding.kind)}\`\n`;
+          markdown += `- Confidence: \`${finding.confidence}\`\n`;
+          markdown += `- Fixability: \`${finding.fixability}\`\n`;
+          markdown += `- Reason: ${finding.reason}\n`;
+          if (finding.suggestedKey) markdown += `- Suggested key: \`${finding.suggestedKey}\`\n`;
+          markdown += '\n';
         }
       }
     }
 
-    // 2. Needs review (medium & low)
-    const review = activeFindings.filter(f => f.confidence === 'medium' || f.confidence === 'low');
-    if (review.length > 0) {
-      md += `## Needs review\n\n`;
-      const grouped = this.groupByFile(review);
-      for (const [file, fileFindings] of Object.entries(grouped)) {
-        md += `### ${file}\n\n`;
-        for (const f of fileFindings) {
-          md += `#### Line ${f.line}\n\n`;
-          md += `Source:\n\n`;
-          md += `\`\`\`tsx\n${f.rawText || ''}\n\`\`\`\n\n`;
-          md += `Reason:\n\n`;
-          md += `${f.reason}\n\n`;
-          md += `Suggested review direction:\n\n`;
-          if (f.kind === 'TemplateLiteralUsedInUserFacingContext') {
-            md += `\`\`\`tsx\nt("${f.suggestedKey || 'key'}", { /* variables */ })\n\`\`\`\n\n`;
-          } else {
-            md += `\`\`\`tsx\n${f.suggestedReplacement || ''}\n\`\`\`\n\n`;
-          }
-        }
-      }
-    }
-
-    return md;
+    return markdown;
   }
 
   public toSARIF(): string {
-    const activeFindings = this.report.findings.filter(f => f.confidence !== 'ignored');
-    const results = activeFindings.map(f => {
-      const level = f.confidence === 'high' ? 'error' : f.confidence === 'medium' ? 'warning' : 'note';
-      return {
-        ruleId: 'i18n-hardcoded-string',
-        level,
-        message: {
-          text: `[i18n-scan] Hardcoded user-facing string detected: "${f.rawText || f.normalizedText}". Reason: ${f.reason}. Suggested Key: ${f.suggestedKey}`
-        },
-        locations: [
-          {
-            physicalLocation: {
-              artifactLocation: {
-                uri: f.filePath
-              },
-              region: {
-                startLine: f.line,
-                startColumn: f.column,
-                endLine: f.endLine,
-                endColumn: f.endColumn
-              }
+    const active = this.report.findings.filter(finding => finding.confidence !== 'ignored');
+    const rules = [...new Set(active.map(finding => ruleId(finding.kind)))].sort().map(id => ({
+      id,
+      shortDescription: { text: 'Hardcoded or embedded user-facing source string' },
+      fullDescription: { text: 'User-facing source copy should follow the configured i18n policy and catalog architecture.' },
+      helpUri: 'https://github.com/NaoufalBtd/i18n-detection'
+    }));
+
+    const results = active.map(finding => ({
+      ruleId: ruleId(finding.kind),
+      level: finding.confidence === 'high' ? 'error' : finding.confidence === 'medium' ? 'warning' : 'note',
+      message: {
+        text: `[i18n-scan] ${finding.reason}. Suggested key: ${finding.suggestedKey ?? 'n/a'}. Fixability: ${finding.fixability}.`
+      },
+      partialFingerprints: {
+        'i18nScanFingerprint/v1': finding.fingerprint
+      },
+      properties: {
+        confidence: finding.confidence,
+        kind: finding.kind,
+        fixability: finding.fixability,
+        suggestedKey: finding.suggestedKey
+      },
+      locations: [
+        {
+          physicalLocation: {
+            artifactLocation: { uri: finding.filePath.replace(/\\/g, '/') },
+            region: {
+              startLine: finding.line,
+              startColumn: finding.column,
+              endLine: finding.endLine,
+              endColumn: finding.endColumn
             }
           }
-        ]
-      };
-    });
-
-    const sarif = {
-      $schema: 'https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json',
-      version: '2.1.0',
-      runs: [
-        {
-          tool: {
-            driver: {
-              name: 'i18n-scan',
-              version: '1.0.0',
-              informationUri: 'https://company.com/i18n-scan',
-              rules: [
-                {
-                  id: 'i18n-hardcoded-string',
-                  shortDescription: {
-                    text: 'Hardcoded user-facing string'
-                  },
-                  fullDescription: {
-                    text: 'User-facing strings should be localized using the configured i18n framework.'
-                  }
-                }
-              ]
-            }
-          },
-          results
         }
       ]
-    };
+    }));
 
-    return JSON.stringify(sarif, null, 2);
+    return JSON.stringify(
+      {
+        $schema: 'https://json.schemastore.org/sarif-2.1.0.json',
+        version: '2.1.0',
+        runs: [
+          {
+            tool: {
+              driver: {
+                name: 'i18n-scan',
+                version: TOOL_VERSION,
+                informationUri: 'https://github.com/NaoufalBtd/i18n-detection',
+                rules
+              }
+            },
+            results
+          }
+        ]
+      },
+      null,
+      2
+    );
   }
 
   public save(format: 'json' | 'markdown' | 'sarif', outputPath: string): void {
-    const content =
-      format === 'json' ? this.toJSON() : format === 'markdown' ? this.toMarkdown() : this.toSARIF();
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, content, 'utf8');
+    const resolved = path.resolve(outputPath);
+    const content = format === 'json' ? this.toJSON() : format === 'markdown' ? this.toMarkdown() : this.toSARIF();
+    if (resolved === path.resolve(process.cwd(), '.i18n-scan-cache.json')) {
+      throw new Error('Report output path cannot overwrite the scanner cache');
+    }
+    writeFilesAtomically([{ filePath: resolved, content }]);
   }
 
   private groupByFile(findings: Finding[]): Record<string, Finding[]> {
     const grouped: Record<string, Finding[]> = {};
-    for (const f of findings) {
-      if (!grouped[f.filePath]) {
-        grouped[f.filePath] = [];
-      }
-      grouped[f.filePath].push(f);
-    }
+    for (const finding of findings) (grouped[finding.filePath] ??= []).push(finding);
     return grouped;
   }
 }
