@@ -110,13 +110,17 @@ function normalizeCallee(value: string): string {
 }
 
 function normalizedPath(value: string): string {
-  return value.replace(/\\/g, '/').toLowerCase();
+  return value.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
 }
 
 function pathMatches(relativeFilePath: string, include: string[]): boolean {
   if (include.length === 0) return true;
   const file = normalizedPath(relativeFilePath);
-  return include.some(pattern => file.includes(normalizedPath(pattern)));
+  return include.some(pattern => {
+    const normalized = normalizedPath(pattern);
+    const directory = normalized.endsWith('/') ? normalized : `${normalized}/`;
+    return file === normalized.replace(/\/$/, '') || file.startsWith(directory);
+  });
 }
 
 function propertyName(node: Node): string | undefined {
