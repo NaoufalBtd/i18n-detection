@@ -14,6 +14,8 @@ describe('state message flow', () => {
       }
     `);
     const finding = report.findings.find(item => item.userFacingContext?.type === 'StateMessage');
+    expect(finding?.kind).toBe('StateMessage');
+    expect(finding?.rule).toBe('i18n/state-message');
     expect(finding?.rawText).toBe('We could not add this item. Please try again.');
     expect(finding?.confidence).toBe('medium');
     expect(finding?.autoFixCandidate).toBe(false);
@@ -30,5 +32,25 @@ describe('state message flow', () => {
       }
     `);
     expect(report.findings.some(item => item.userFacingContext?.type === 'StateMessage')).toBe(false);
+  });
+
+  it('binds same-named state variables and setters to their owning component scope', () => {
+    const scanner = new Scanner(DEFAULT_CONFIG);
+    const report = scanner.scanInMemory('apps/web/src/MultiPanel.tsx', `
+      import { useState } from 'react';
+      export function VisiblePanel() {
+        const [message, setMessage] = useState('');
+        const fail = () => setMessage('Visible customer message');
+        return <div>{message}</div>;
+      }
+      export function InternalPanel() {
+        const [message, setMessage] = useState('idle');
+        const start = () => setMessage('background-processing');
+        return <button onClick={start}>Run</button>;
+      }
+    `);
+    const stateMessages = report.findings.filter(item => item.kind === 'StateMessage');
+    expect(stateMessages).toHaveLength(1);
+    expect(stateMessages[0].rawText).toBe('Visible customer message');
   });
 });
