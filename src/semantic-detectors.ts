@@ -200,7 +200,6 @@ function isInsideJsxExpression(node: Node, owningScope: Node | undefined): boole
   let current: Node | undefined = node.getParent();
   while (current) {
     if (Node.isJsxExpression(current)) return true;
-    if (isFunctionScope(current) && current !== owningScope) return false;
     if (current === owningScope) return false;
     current = current.getParent();
   }
@@ -208,7 +207,13 @@ function isInsideJsxExpression(node: Node, owningScope: Node | undefined): boole
 }
 
 function sameScope(node: Node, scope: Node | undefined): boolean {
-  return nearestFunctionScope(node) === scope;
+  if (!scope) return nearestFunctionScope(node) === undefined;
+  let current: Node | undefined = node;
+  while (current) {
+    if (current === scope) return true;
+    current = current.getParent();
+  }
+  return false;
 }
 
 function definitionMatches(identifier: Identifier, binding: Node): boolean {
@@ -290,11 +295,7 @@ function isTranslationApiCall(call: Node, config: ScannerConfig): boolean {
   return Boolean(config.semantic?.translationApis.some(rule => normalizeCallee(rule.callee) === callee));
 }
 
-function addCandidate(
-  target: SemanticCandidate[],
-  seen: Set<string>,
-  candidate: SemanticCandidate
-): void {
+function addCandidate(target: SemanticCandidate[], seen: Set<string>, candidate: SemanticCandidate): void {
   const key = `${candidate.node.getStart()}:${candidate.kind}:${candidate.context.type}:${candidate.rule ?? ''}`;
   if (seen.has(key)) return;
   seen.add(key);
@@ -454,18 +455,14 @@ function visitSemanticRegistryValues(
       if (!initializer) continue;
       if (semanticKeys.has(name) && stringBearingExpression(initializer)) callback(initializer, name);
       const child = unwrapExpression(initializer);
-      if (asObjectLiteral(child) || asArrayLiteral(child)) {
-        visitSemanticRegistryValues(child, semanticKeys, callback);
-      }
+      if (asObjectLiteral(child) || asArrayLiteral(child)) visitSemanticRegistryValues(child, semanticKeys, callback);
     }
     return;
   }
 
   const array = asArrayLiteral(value);
   if (array) {
-    for (const element of array.getElements()) {
-      visitSemanticRegistryValues(element, semanticKeys, callback);
-    }
+    for (const element of array.getElements()) visitSemanticRegistryValues(element, semanticKeys, callback);
   }
 }
 
@@ -688,11 +685,7 @@ function detectSchemaDefaults(
   }
 }
 
-function detectStateMessages(
-  index: SemanticIndex,
-  candidates: SemanticCandidate[],
-  seen: Set<string>
-): void {
+function detectStateMessages(index: SemanticIndex, candidates: SemanticCandidate[], seen: Set<string>): void {
   for (const variable of index.variables) {
     const nameNode = variable.getNameNode();
     const initializer = variable.getInitializer();
