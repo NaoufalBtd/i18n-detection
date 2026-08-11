@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { loadConfig, DEFAULT_CONFIG } from './config.js';
 import { Scanner } from './scanner.js';
 import { Reporter } from './reporter.js';
-import { Extractor } from './extractor.js';
+import { Extractor, type LocaleParityIssue } from './extractor.js';
 import { CodemodEngine, selectFixableFindings } from './codemod.js';
 import { CacheManager } from './cache.js';
 import { writeFilesAtomically } from './io.js';
@@ -151,11 +151,18 @@ function loadBaseline(filePath: string): { ids: Set<string>; fingerprints: Set<s
   return { ids, fingerprints };
 }
 
+function enrichTranslationCatalogStatus(config: ScannerConfig, report: ScanReport): Extractor {
+  const extractor = new Extractor(config);
+  extractor.enrichTranslationFindings(report.findings, config.i18n.sourceLocale);
+  return extractor;
+}
+
 function reportCatalogPlan(plan: ReturnType<Extractor['planCatalogs']>[number]): void {
   const route = plan.namespace ? ` (namespace ${plan.namespace}${plan.stripNamespace ? ', stripped' : ''})` : '';
   console.log(`Catalog: ${path.relative(process.cwd(), plan.catalogPath) || plan.catalogPath}${route}`);
   console.log(`New entries: ${plan.report.newEntries.length}`);
-  console.log(`Existing/reused entries: ${plan.report.existingMatches.length + plan.report.similarValues.length}`);
+  console.log(`Existing exact-key matches: ${plan.report.existingMatches.length}`);
+  console.log(`Similar-value suggestions: ${plan.report.similarValues.length}`);
   console.log(`Key collisions: ${plan.report.keyCollisions.length}`);
   console.log(`Blocked findings: ${plan.report.blockedFindings.length}`);
 }
@@ -164,6 +171,15 @@ function reportCatalogPlans(plans: ReturnType<Extractor['planCatalogs']>): void 
   for (const [index, plan] of plans.entries()) {
     if (index > 0) console.log('');
     reportCatalogPlan(plan);
+  }
+}
+
+function reportLocaleParityIssues(issues: LocaleParityIssue[], prefix: string): void {
+  if (issues.length === 0) return;
+  console.error(`${prefix} (${issues.length} issue(s)):`);
+  for (const issue of issues) {
+    const catalog = issue.catalogPath ? ` [${path.relative(process.cwd(), issue.catalogPath)}]` : '';
+    console.error(`- ${issue.locale} ${issue.key}: ${issue.reason}${catalog}`);
   }
 }
 
@@ -209,6 +225,7 @@ program
     }
 
     const report = scanner.scanFiles(targetFiles, options.cache !== false);
+    enrichTranslationCatalogStatus(config, report);
     filterReportByConfidence(report, parseConfidence(options.confidence));
     const reporter = new Reporter(report);
     if (options.json) reporter.save('json', options.json);
@@ -232,7 +249,9 @@ program
       );
       if (newHigh.length > 0) {
         console.error(`Found ${newHigh.length} new high-confidence finding(s):`);
-        for (const finding of newHigh) console.error(`- ${finding.filePath}:${finding.line} ${finding.rawText ?? finding.normalizedText ?? ''}`);
+        for (const finding of newHigh) {
+          console.error(`- ${finding.filePath}:${finding.line} ${finding.rawText ?? finding.normalizedText ?? ''}`);
+        }
         process.exitCode = 1;
       } else {
         console.log('No new high-confidence findings.');
@@ -259,7 +278,7 @@ program
     }
 
     const report = scanner.scanFiles(targetFiles);
-    const extractor = new Extractor(config);
+    const extractor = enrichTranslationCatalogStatus(config, report);
     const plans = extractor.planCatalogs(report.findings, locale);
     reportCatalogPlans(plans);
 
@@ -270,12 +289,24 @@ program
       for (const blocked of plan.report.blockedFindings) {
         console.warn(`Review required ${blocked.filePath}: ${blocked.reason}`);
       }
+      for (const similar of plan.report.similarValues) {
+        console.warn(`Similar source value ${similar.filePath}: '${similar.value}' already exists at '${similar.existingKey}', but automatic semantic reuse is disabled.`);
+      }
     }
 
-    if (plans.some(plan => plan.report.keyCollisions.length > 0)) {
+    if (plans.some(plan => plan.report.keyCollisions.length > 0 || plan.report.blockedFindings.length > 0)) {
       process.exitCode = 1;
       return;
     }
+
+    if (locale === config.i18n.sourceLocale) {
+      const parityIssues = extractor.validateRequiredLocales(plans);
+      if (parityIssues.length > 0) {
+        reportLocaleParityIssues(parityIssues, 'Required locale follow-up');
+        console.warn('Source catalog extraction may continue, but source-code mutation remains blocked until required locales contain compatible keys.');
+      }
+    }
+
     if (options.merge && !options.dryRun) {
       extractor.writePlans(plans);
       const changed = plans.filter(plan => plan.changed).length;
@@ -310,13 +341,13 @@ program
     }
 
     const report = scanner.scanFiles(targetFiles, options.cache !== false);
+    const extractor = enrichTranslationCatalogStatus(config, report);
     const selected = selectFixableFindings(report.findings, { confidence: minimum, findingId: options.findingId });
     if (selected.length === 0) {
       console.log('No safe auto-fix findings matched the requested scope.');
       return;
     }
 
-    const extractor = new Extractor(config);
     const catalogPlans = extractor.planCatalogs(selected, config.i18n.sourceLocale);
     reportCatalogPlans(catalogPlans);
     if (
@@ -329,10 +360,14 @@ program
       return;
     }
 
-    const keyOverrides = Object.assign(
-      {},
-      ...catalogPlans.map(plan => plan.keyByFindingId)
-    ) as Record<string, string>;
+    const parityIssues = extractor.validateRequiredLocales(catalogPlans);
+    if (parityIssues.length > 0) {
+      reportLocaleParityIssues(parityIssues, 'Refusing source mutation because required locales are incomplete or incompatible');
+      process.exitCode = 1;
+      return;
+    }
+
+    const keyOverrides = Object.assign({}, ...catalogPlans.map(plan => plan.keyByFindingId)) as Record<string, string>;
     const codemod = new CodemodEngine(config);
     const results = codemod.planCodemods(report.findings, targetFiles, {
       dryRun: true,
@@ -362,7 +397,7 @@ program
 
     const isDryRun = !options.write || options.dryRun === true;
     if (isDryRun) {
-      console.log('\nDry-run complete. Source and catalog changes were validated but not written.');
+      console.log('\nDry-run complete. Source, catalog, locale parity, and configured project checks passed; nothing was written.');
       return;
     }
 
