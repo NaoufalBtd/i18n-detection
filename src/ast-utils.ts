@@ -1,4 +1,4 @@
-import { Node } from 'ts-morph';
+import { Node, type ArrayLiteralExpression, type ObjectLiteralExpression } from 'ts-morph';
 
 /**
  * Removes syntax-only wrappers that do not change the runtime value of an expression.
@@ -22,13 +22,13 @@ export function unwrapExpression(node: Node): Node {
   }
 }
 
-export function asObjectLiteral(node: Node | undefined): ReturnType<Node['asKind']> | undefined {
+export function asObjectLiteral(node: Node | undefined): ObjectLiteralExpression | undefined {
   if (!node) return undefined;
   const unwrapped = unwrapExpression(node);
   return Node.isObjectLiteralExpression(unwrapped) ? unwrapped : undefined;
 }
 
-export function asArrayLiteral(node: Node | undefined): ReturnType<Node['asKind']> | undefined {
+export function asArrayLiteral(node: Node | undefined): ArrayLiteralExpression | undefined {
   if (!node) return undefined;
   const unwrapped = unwrapExpression(node);
   return Node.isArrayLiteralExpression(unwrapped) ? unwrapped : undefined;
