@@ -61,7 +61,7 @@ describe('codemod safety', () => {
     });
   });
 
-  it('blocks a namespaced translator rather than guessing key semantics', () => {
+  it('converts a global planned key to a deterministic namespace-relative call', () => {
     withSource(`
       import { useTranslations } from 'next-intl';
       export function Page() {
@@ -71,12 +71,36 @@ describe('codemod safety', () => {
     `, (root, filePath) => {
       const config = codemodConfig();
       const report = new Scanner(config, root).scanFiles([filePath], false);
+      const finding = report.findings.find(item => item.rawText === 'Hello world')!;
+      expect(finding.suggestedKey?.startsWith('Page.')).toBe(true);
       const result = new CodemodEngine(config, root).planCodemods(report.findings, [filePath], {
         dryRun: true,
         confidence: 'high'
       })[0];
+      expect(result.success).toBe(true);
+      expect(result.plannedContent).toContain('t("page.helloWorld")');
+      expect(result.plannedContent).not.toContain('t("Page.page.helloWorld")');
+    });
+  });
+
+  it('blocks namespaced codemods when the catalog key is outside the visible namespace', () => {
+    withSource(`
+      import { useTranslations } from 'next-intl';
+      export function Page() {
+        const t = useTranslations('products.listing');
+        return <h1>Hello world</h1>;
+      }
+    `, (root, filePath) => {
+      const config = codemodConfig();
+      const report = new Scanner(config, root).scanFiles([filePath], false);
+      const finding = report.findings.find(item => item.rawText === 'Hello world')!;
+      const result = new CodemodEngine(config, root).planCodemods(report.findings, [filePath], {
+        dryRun: true,
+        confidence: 'high',
+        keyOverrides: { [finding.id]: 'ui.common.helloWorld' }
+      })[0];
       expect(result.success).toBe(false);
-      expect(result.blocked[0].reason).toMatch(/namespace/);
+      expect(result.blocked[0].reason).toMatch(/outside that namespace/);
     });
   });
 
@@ -95,6 +119,43 @@ describe('codemod safety', () => {
       })[0];
       expect(result.success).toBe(true);
       expect(result.plannedContent).toContain('const t = useTranslations();');
+    });
+  });
+
+  it('blocks a syntactically valid rewrite when configured project TypeScript validation introduces diagnostics', () => {
+    withSource(`export function Page(){ return <h1>Hello world</h1>; }`, (root, filePath) => {
+      fs.writeFileSync(
+        path.join(root, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            target: 'ES2022',
+            module: 'NodeNext',
+            moduleResolution: 'NodeNext',
+            jsx: 'react-jsx',
+            noEmit: true,
+            skipLibCheck: true
+          },
+          include: ['Page.tsx']
+        }),
+        'utf8'
+      );
+      const base = codemodConfig();
+      const config: ScannerConfig = {
+        ...base,
+        codemod: {
+          ...base.codemod,
+          framework: 'next-intl',
+          tsconfigPath: 'tsconfig.json',
+          requireProjectValidation: true
+        }
+      };
+      const report = new Scanner(config, root).scanFiles([filePath], false);
+      const result = new CodemodEngine(config, root).planCodemods(report.findings, [filePath], {
+        dryRun: true,
+        confidence: 'high'
+      })[0];
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/Project TypeScript validation/);
     });
   });
 });
