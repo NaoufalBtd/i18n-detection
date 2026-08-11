@@ -1,6 +1,6 @@
 {
   "name": "@company/i18n-scan",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Production-oriented AST detector for hardcoded user-facing strings",
   "type": "module",
   "main": "./dist/index.js",
@@ -29,6 +29,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bench": "vitest bench --run",
     "check": "npm run build && npm test",
     "scan": "node dist/cli.js scan",
     "apply": "node dist/cli.js apply"
