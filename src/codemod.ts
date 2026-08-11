@@ -1,10 +1,12 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   Project,
   SyntaxKind,
   Node,
-  type SourceFile,
   type Block,
+  type Diagnostic,
+  type SourceFile,
   ts
 } from 'ts-morph';
 import type { Finding, ScannerConfig, Confidence } from './types.js';
@@ -182,9 +184,99 @@ function validateSyntax(filePath: string, content: string): string | undefined {
   });
   const errors = (result.diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error);
   if (errors.length === 0) return undefined;
-  return errors
-    .map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
-    .join('; ');
+  return errors.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')).join('; ');
+}
+
+function diagnosticIdentity(diagnostic: Diagnostic): string {
+  const source = diagnostic.getSourceFile();
+  const file = source?.getFilePath() ?? '';
+  return JSON.stringify({
+    code: diagnostic.getCode(),
+    file,
+    start: diagnostic.getStart(),
+    message: diagnostic.getMessageText().toString()
+  });
+}
+
+function diagnosticsForFile(project: Project, filePath: string): Diagnostic[] {
+  const absolute = path.resolve(filePath);
+  return project.getPreEmitDiagnostics().filter(diagnostic => {
+    const source = diagnostic.getSourceFile();
+    return source ? path.resolve(source.getFilePath()) === absolute : false;
+  });
+}
+
+function validateProjectChanges(
+  config: ScannerConfig,
+  projectRoot: string,
+  results: CodemodResult[]
+): void {
+  const tsconfigPath = config.codemod?.tsconfigPath;
+  if (!tsconfigPath) return;
+
+  const resolvedTsconfig = path.resolve(projectRoot, tsconfigPath);
+  const modified = results.filter(result => result.modified && result.plannedContent !== undefined);
+  if (modified.length === 0) return;
+
+  try {
+    if (!fs.existsSync(resolvedTsconfig)) {
+      throw new Error(`Configured tsconfig was not found: ${resolvedTsconfig}`);
+    }
+    const project = new Project({ tsConfigFilePath: resolvedTsconfig });
+    const baseline = new Map<string, Set<string>>();
+
+    for (const result of modified) {
+      const absoluteFile = path.resolve(projectRoot, result.filePath);
+      baseline.set(
+        result.filePath,
+        new Set(diagnosticsForFile(project, absoluteFile).map(diagnosticIdentity))
+      );
+    }
+
+    for (const result of modified) {
+      const absoluteFile = path.resolve(projectRoot, result.filePath);
+      project.createSourceFile(absoluteFile, result.plannedContent!, { overwrite: true });
+    }
+
+    for (const result of modified) {
+      const absoluteFile = path.resolve(projectRoot, result.filePath);
+      const previous = baseline.get(result.filePath) ?? new Set<string>();
+      const introduced = diagnosticsForFile(project, absoluteFile)
+        .filter(diagnostic => !previous.has(diagnosticIdentity(diagnostic)));
+      if (introduced.length === 0) continue;
+
+      result.success = false;
+      result.modified = false;
+      result.plannedContent = undefined;
+      result.error = `Project TypeScript validation introduced ${introduced.length} diagnostic(s): ${introduced
+        .slice(0, 5)
+        .map(diagnostic => `${diagnostic.getCode()}: ${diagnostic.getMessageText().toString()}`)
+        .join('; ')}`;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const result of modified) {
+      result.success = false;
+      result.modified = false;
+      result.plannedContent = undefined;
+      result.error = `Project TypeScript validation failed: ${message}`;
+    }
+  }
+}
+
+function keyForBinding(globalKey: string, binding: TranslationBinding): { key?: string; reason?: string } {
+  if (binding.type !== 'known' || !binding.namespace) return { key: globalKey };
+  const prefix = `${binding.namespace}.`;
+  if (!globalKey.startsWith(prefix)) {
+    return {
+      reason: `Existing translator is scoped to namespace '${binding.namespace}', but planned key '${globalKey}' is outside that namespace`
+    };
+  }
+  const relative = globalKey.slice(prefix.length);
+  if (!relative) {
+    return { reason: `Planned key '${globalKey}' has no namespace-relative segment` };
+  }
+  return { key: relative };
 }
 
 export function selectFixableFindings(findings: Finding[], options: Pick<CodemodOptions, 'confidence' | 'findingId'>): Finding[] {
@@ -240,9 +332,7 @@ export class CodemodEngine {
       const fileFindings = byFile.get(relativePath);
       if (!fileFindings?.length) continue;
 
-      const project = new Project({
-        compilerOptions: { allowJs: true, jsx: ts.JsxEmit.ReactJSX }
-      });
+      const project = new Project({ compilerOptions: { allowJs: true, jsx: ts.JsxEmit.ReactJSX } });
       const sourceFile = project.addSourceFileAtPath(absoluteFile);
       const result: CodemodResult = {
         filePath: relativePath,
@@ -257,7 +347,7 @@ export class CodemodEngine {
           .map(finding => ({ finding, node: findNodeAtLineAndColumn(sourceFile, finding.line, finding.column) }))
           .sort((a, b) => b.finding.line - a.finding.line || b.finding.column - a.finding.column);
         const injections = new Map<Block, PlannedInjection>();
-        const plannedTargets: { finding: Finding; node: Node; key: string }[] = [];
+        const plannedTargets: { finding: Finding; node: Node; globalKey: string; callKey: string }[] = [];
 
         for (const target of targets) {
           const { finding, node } = target;
@@ -266,22 +356,24 @@ export class CodemodEngine {
             continue;
           }
 
-          const key = options.keyOverrides?.[finding.id] ?? finding.suggestedKey;
-          if (!key) {
+          const globalKey = options.keyOverrides?.[finding.id] ?? finding.suggestedKey;
+          if (!globalKey) {
             result.blocked.push({ findingId: finding.id, reason: 'No catalog key is available for this finding' });
             continue;
           }
 
           const binding = findVisibleTranslationBinding(node, this.config);
           if (binding.type === 'unknown') {
-            result.blocked.push({ findingId: finding.id, reason: `A '${this.config.i18n.translationFunctionName}' binding exists but is not a recognized next-intl translator` });
-            continue;
-          }
-          if (binding.type === 'known' && binding.namespace) {
             result.blocked.push({
               findingId: finding.id,
-              reason: `Existing translator is scoped to namespace '${binding.namespace}'; generated global keys are not rewritten across namespace boundaries automatically`
+              reason: `A '${this.config.i18n.translationFunctionName}' binding exists but is not a recognized next-intl translator`
             });
+            continue;
+          }
+
+          const boundKey = keyForBinding(globalKey, binding);
+          if (!boundKey.key) {
+            result.blocked.push({ findingId: finding.id, reason: boundKey.reason ?? 'Unable to resolve translation key for visible binding' });
             continue;
           }
 
@@ -309,18 +401,18 @@ export class CodemodEngine {
             injections.set(component.block, { block: component.block, async: component.async });
           }
 
-          plannedTargets.push({ finding, node, key });
+          plannedTargets.push({ finding, node, globalKey, callKey: boundKey.key });
         }
 
         for (const target of plannedTargets) {
-          const { finding, node, key } = target;
+          const { finding, node, callKey } = target;
           const tName = this.config.i18n.translationFunctionName;
           const originalLine = sourceFile.getFullText().split(/\r?\n/)[finding.line - 1] ?? '';
           let replacement: string;
           if (finding.fixStrategy === 'replace-jsx-text') {
-            replacement = `{${tName}("${key}")}`;
+            replacement = `{${tName}("${callKey}")}`;
           } else if (finding.fixStrategy === 'replace-jsx-attribute') {
-            replacement = Node.isJsxExpression(node.getParent()) ? `${tName}("${key}")` : `{${tName}("${key}")}`;
+            replacement = Node.isJsxExpression(node.getParent()) ? `${tName}("${callKey}")` : `{${tName}("${callKey}")}`;
           } else {
             result.blocked.push({ findingId: finding.id, reason: `Unsupported fix strategy '${finding.fixStrategy ?? 'none'}'` });
             continue;
@@ -361,6 +453,7 @@ export class CodemodEngine {
       }
     }
 
+    validateProjectChanges(this.config, this.projectRoot, results);
     return results;
   }
 
