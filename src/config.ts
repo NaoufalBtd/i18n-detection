@@ -10,13 +10,15 @@ export class ConfigError extends Error {
 }
 
 export const DEFAULT_CONFIG: ScannerConfig = {
-  include: ['src/**/*.{ts,tsx}'],
+  include: [
+    'src/**/*.{js,jsx,ts,tsx}',
+    'apps/*/src/**/*.{js,jsx,ts,tsx}',
+    'packages/*/src/**/*.{js,jsx,ts,tsx}'
+  ],
   exclude: [
-    '**/*.test.ts',
-    '**/*.test.tsx',
-    '**/*.spec.ts',
-    '**/*.spec.tsx',
-    '**/*.stories.tsx',
+    '**/*.test.{js,jsx,ts,tsx}',
+    '**/*.spec.{js,jsx,ts,tsx}',
+    '**/*.stories.{js,jsx,ts,tsx}',
     '**/__tests__/**',
     '**/mocks/**',
     '**/fixtures/**',
@@ -31,6 +33,7 @@ export const DEFAULT_CONFIG: ScannerConfig = {
     clientHook: 'useTranslations',
     serverAsyncFunction: 'getTranslations',
     messagesPath: 'messages/{locale}.json',
+    catalogRoutes: [],
     catalogFormat: 'nested-json',
     keyStyle: 'namespace.dot.camelCase'
   },
@@ -135,6 +138,51 @@ export const DEFAULT_CONFIG: ScannerConfig = {
   scanErrors: false,
   uiConfigVariables: ['columns', 'tabs', 'steps', 'menuItems', 'navItems'],
   uiConfigTypes: ['ColumnDef', 'TabItem', 'StepConfig', 'MenuItem'],
+  semantic: {
+    translationApis: [
+      { callee: 't', fallbackArgument: 1, optionsArgument: 1, defaultValueProperty: 'defaultValue' },
+      { callee: 'translations.t', fallbackArgument: 1 },
+      { callee: 'getTranslation', fallbackArgument: 1 }
+    ],
+    presentationFilePatterns: [
+      'presentation',
+      'presenter',
+      'adapter',
+      'view-model',
+      'viewmodel',
+      'translations',
+      'columns'
+    ],
+    presentationFunctionPatterns: [
+      '^get.*Presentation$',
+      '^adapt',
+      '^map.*Presentation$',
+      '^use.*Translations$',
+      '^get.*Columns$'
+    ],
+    presentationObjectKeys: [
+      'title',
+      'subtitle',
+      'description',
+      'label',
+      'defaultLabel',
+      'message',
+      'helperText',
+      'emptyText',
+      'header',
+      'footer',
+      'caption',
+      'tooltip',
+      'placeholder',
+      'actionLabel',
+      'primary',
+      'secondary'
+    ],
+    translationObjectVariables: ['labels', 'copy', 'messages', 'translations'],
+    inlineLocaleKeys: ['en', 'fr', 'ar'],
+    scanValidationMessages: true,
+    scanNextMetadata: true
+  },
   features: {
     sameFileConstants: true,
     sameFileObjects: true,
@@ -165,7 +213,6 @@ function stringArray(value: unknown, name: string, errors: string[]): void {
   }
 }
 
-
 function validateRawConfig(raw: Record<string, unknown>): void {
   const allowedTopLevel = new Set([
     'include',
@@ -182,6 +229,7 @@ function validateRawConfig(raw: Record<string, unknown>): void {
     'scanErrors',
     'uiConfigVariables',
     'uiConfigTypes',
+    'semantic',
     'features',
     'codemod'
   ]);
@@ -189,14 +237,44 @@ function validateRawConfig(raw: Record<string, unknown>): void {
   if (unknown.length > 0) {
     throw new ConfigError(`Unknown configuration field(s): ${unknown.join(', ')}`);
   }
-  for (const nested of ['i18n', 'features', 'codemod'] as const) {
+  for (const nested of ['i18n', 'semantic', 'features', 'codemod'] as const) {
     if (nested in raw && !isRecord(raw[nested])) {
       throw new ConfigError(`${nested} must be a JSON object`);
     }
   }
   const nestedFields: Record<string, Set<string>> = {
-    i18n: new Set(['library', 'sourceLocale', 'translationFunctionName', 'clientHook', 'serverAsyncFunction', 'messagesPath', 'catalogFormat', 'keyStyle']),
-    features: new Set(['sameFileConstants', 'sameFileObjects', 'conditionalStrings', 'templateLiterals', 'stringConcatenation', 'crossFileConstants', 'codemod', 'insertClientTranslations', 'insertServerTranslations']),
+    i18n: new Set([
+      'library',
+      'sourceLocale',
+      'translationFunctionName',
+      'clientHook',
+      'serverAsyncFunction',
+      'messagesPath',
+      'catalogRoutes',
+      'catalogFormat',
+      'keyStyle'
+    ]),
+    semantic: new Set([
+      'translationApis',
+      'presentationFilePatterns',
+      'presentationFunctionPatterns',
+      'presentationObjectKeys',
+      'translationObjectVariables',
+      'inlineLocaleKeys',
+      'scanValidationMessages',
+      'scanNextMetadata'
+    ]),
+    features: new Set([
+      'sameFileConstants',
+      'sameFileObjects',
+      'conditionalStrings',
+      'templateLiterals',
+      'stringConcatenation',
+      'crossFileConstants',
+      'codemod',
+      'insertClientTranslations',
+      'insertServerTranslations'
+    ]),
     codemod: new Set(['framework'])
   };
   for (const [section, allowed] of Object.entries(nestedFields)) {
@@ -238,6 +316,32 @@ function validateConfig(config: ScannerConfig): void {
     if (config.i18n.keyStyle !== 'namespace.dot.camelCase') {
       errors.push('i18n.keyStyle currently supports only namespace.dot.camelCase');
     }
+    if (config.i18n.catalogRoutes !== undefined) {
+      if (!Array.isArray(config.i18n.catalogRoutes)) {
+        errors.push('i18n.catalogRoutes must be an array');
+      } else {
+        const namespaces = new Set<string>();
+        for (const [index, route] of config.i18n.catalogRoutes.entries()) {
+          if (!isRecord(route)) {
+            errors.push(`i18n.catalogRoutes.${index} must be an object`);
+            continue;
+          }
+          if (typeof route.namespace !== 'string' || route.namespace.trim() === '') {
+            errors.push(`i18n.catalogRoutes.${index}.namespace must be a non-empty string`);
+          } else if (namespaces.has(route.namespace)) {
+            errors.push(`i18n.catalogRoutes contains duplicate namespace '${route.namespace}'`);
+          } else {
+            namespaces.add(route.namespace);
+          }
+          if (typeof route.messagesPath !== 'string' || route.messagesPath.trim() === '') {
+            errors.push(`i18n.catalogRoutes.${index}.messagesPath must be a non-empty string`);
+          }
+          if (route.stripNamespace !== undefined && typeof route.stripNamespace !== 'boolean') {
+            errors.push(`i18n.catalogRoutes.${index}.stripNamespace must be boolean`);
+          }
+        }
+      }
+    }
   }
 
   if (!isRecord(config.checkedComponentProps)) errors.push('checkedComponentProps must be an object');
@@ -262,6 +366,49 @@ function validateConfig(config: ScannerConfig): void {
   if (config.scanErrors !== undefined && typeof config.scanErrors !== 'boolean') errors.push('scanErrors must be boolean');
   if (config.uiConfigVariables !== undefined) stringArray(config.uiConfigVariables, 'uiConfigVariables', errors);
   if (config.uiConfigTypes !== undefined) stringArray(config.uiConfigTypes, 'uiConfigTypes', errors);
+
+  if (config.semantic) {
+    if (!isRecord(config.semantic)) errors.push('semantic must be an object');
+    else {
+      stringArray(config.semantic.presentationFilePatterns, 'semantic.presentationFilePatterns', errors);
+      stringArray(config.semantic.presentationFunctionPatterns, 'semantic.presentationFunctionPatterns', errors);
+      stringArray(config.semantic.presentationObjectKeys, 'semantic.presentationObjectKeys', errors);
+      stringArray(config.semantic.translationObjectVariables, 'semantic.translationObjectVariables', errors);
+      stringArray(config.semantic.inlineLocaleKeys, 'semantic.inlineLocaleKeys', errors);
+      if (typeof config.semantic.scanValidationMessages !== 'boolean') {
+        errors.push('semantic.scanValidationMessages must be boolean');
+      }
+      if (typeof config.semantic.scanNextMetadata !== 'boolean') {
+        errors.push('semantic.scanNextMetadata must be boolean');
+      }
+      if (!Array.isArray(config.semantic.translationApis)) {
+        errors.push('semantic.translationApis must be an array');
+      } else {
+        for (const [index, rule] of config.semantic.translationApis.entries()) {
+          if (!isRecord(rule) || typeof rule.callee !== 'string' || rule.callee.trim() === '') {
+            errors.push(`semantic.translationApis.${index}.callee must be a non-empty string`);
+            continue;
+          }
+          for (const field of ['fallbackArgument', 'optionsArgument'] as const) {
+            const value = rule[field];
+            if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+              errors.push(`semantic.translationApis.${index}.${field} must be a non-negative integer`);
+            }
+          }
+          if (rule.defaultValueProperty !== undefined && typeof rule.defaultValueProperty !== 'string') {
+            errors.push(`semantic.translationApis.${index}.defaultValueProperty must be a string`);
+          }
+        }
+      }
+      for (const [index, pattern] of config.semantic.presentationFunctionPatterns.entries()) {
+        try {
+          new RegExp(pattern);
+        } catch {
+          errors.push(`semantic.presentationFunctionPatterns.${index} must be a valid regular expression`);
+        }
+      }
+    }
+  }
 
   if (!isRecord(config.features)) errors.push('features must be an object');
   else {
@@ -317,6 +464,7 @@ export function loadConfig(configPath?: string): ScannerConfig {
     ...base,
     ...loaded,
     i18n: { ...base.i18n, ...(isRecord(loaded.i18n) ? loaded.i18n : {}) },
+    semantic: { ...base.semantic, ...(isRecord(loaded.semantic) ? loaded.semantic : {}) },
     features: { ...base.features, ...(isRecord(loaded.features) ? loaded.features : {}) },
     codemod: { ...base.codemod, ...(isRecord(loaded.codemod) ? loaded.codemod : {}) }
   } as ScannerConfig;

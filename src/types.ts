@@ -10,6 +10,12 @@ export type FindingKind =
   | 'ConditionalStringUsedInUserFacingContext'
   | 'TemplateLiteralUsedInUserFacingContext'
   | 'StringConcatenationUsedInUserFacingContext'
+  | 'TranslationFallback'
+  | 'TranslationDefaultValue'
+  | 'PresentationObjectString'
+  | 'InlineLocaleCatalogString'
+  | 'ValidationMessage'
+  | 'NextMetadataString'
   | 'ErrorString'
   | 'AmbiguousString';
 
@@ -67,6 +73,30 @@ export interface Finding {
 
 export type CodemodFramework = 'next-intl' | 'react-i18next' | 'generic';
 
+export interface CatalogRoute {
+  namespace: string;
+  messagesPath: string;
+  stripNamespace?: boolean;
+}
+
+export interface TranslationApiRule {
+  callee: string;
+  fallbackArgument?: number;
+  optionsArgument?: number;
+  defaultValueProperty?: string;
+}
+
+export interface SemanticScanConfig {
+  translationApis: TranslationApiRule[];
+  presentationFilePatterns: string[];
+  presentationFunctionPatterns: string[];
+  presentationObjectKeys: string[];
+  translationObjectVariables: string[];
+  inlineLocaleKeys: string[];
+  scanValidationMessages: boolean;
+  scanNextMetadata: boolean;
+}
+
 export interface ScannerConfig {
   include: string[];
   exclude: string[];
@@ -77,6 +107,7 @@ export interface ScannerConfig {
     clientHook: string;
     serverAsyncFunction: string;
     messagesPath: string;
+    catalogRoutes?: CatalogRoute[];
     catalogFormat: 'nested-json' | 'flat-json';
     keyStyle: string;
   };
@@ -91,6 +122,7 @@ export interface ScannerConfig {
   scanErrors?: boolean;
   uiConfigVariables?: string[];
   uiConfigTypes?: string[];
+  semantic?: SemanticScanConfig;
   features: {
     sameFileConstants: boolean;
     sameFileObjects: boolean;

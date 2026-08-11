@@ -12,6 +12,7 @@ import {
   ts
 } from 'ts-morph';
 import { CacheManager, hashContent } from './cache.js';
+import { detectSemanticCandidates } from './semantic-detectors.js';
 import { REPORT_SCHEMA_VERSION } from './version.js';
 import type {
   ScannerConfig,
@@ -172,6 +173,24 @@ function getContainingComponentName(node: Node): string | undefined {
   return undefined;
 }
 
+function isFunctionScope(node: Node): boolean {
+  return (
+    Node.isFunctionDeclaration(node) ||
+    Node.isArrowFunction(node) ||
+    Node.isFunctionExpression(node) ||
+    Node.isMethodDeclaration(node)
+  );
+}
+
+function nearestFunctionScope(node: Node): Node | undefined {
+  let current = node.getParent();
+  while (current) {
+    if (isFunctionScope(current)) return current;
+    current = current.getParent();
+  }
+  return undefined;
+}
+
 function expressionPlaceholder(expression: Node, index: number, used: Set<string>): string {
   let base = `value${index}`;
   if (Node.isIdentifier(expression)) base = expression.getText();
@@ -261,6 +280,35 @@ export class Scanner {
     const parsed = path.parse(normalized);
     if (parsed.name && parsed.name !== 'index' && parsed.name !== 'page') return camelCase(parsed.name) || 'common';
     return 'common';
+  }
+
+  private inferBoundTranslationNamespace(node: Node): string | undefined {
+    const scopes: Node[] = [];
+    let current = node.getParent();
+    while (current) {
+      if (isFunctionScope(current)) scopes.push(current);
+      current = current.getParent();
+    }
+    scopes.push(node.getSourceFile());
+
+    for (const scope of scopes) {
+      const namespaces = new Set<string>();
+      for (const call of scope.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        const owner = nearestFunctionScope(call);
+        if (Node.isSourceFile(scope)) {
+          if (owner) continue;
+        } else if (owner !== scope) {
+          continue;
+        }
+        const callee = call.getExpression().getText().replace(/\s+/g, '');
+        if (callee !== this.config.i18n.clientHook && callee !== this.config.i18n.serverAsyncFunction) continue;
+        const firstArg = call.getArguments()[0];
+        if (firstArg && Node.isStringLiteral(firstArg)) namespaces.add(firstArg.getLiteralValue());
+      }
+      if (namespaces.size === 1) return [...namespaces][0];
+      if (namespaces.size > 1) return undefined;
+    }
+    return undefined;
   }
 
   private generateSuggestedKey(text: string, namespace: string, contextName?: string, propOrKey?: string): string {
@@ -437,7 +485,9 @@ export class Scanner {
     if (traced.type === 'template_literal') {
       finalKind = 'TemplateLiteralUsedInUserFacingContext';
       finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
-      reason = 'Template literal requires interpolation/pluralization review';
+      reason = context.type === 'TranslatedLiteralFragment'
+        ? 'Template literal mixes translated output with hardcoded literal fragments'
+        : 'Template literal requires interpolation/pluralization review';
     } else if (traced.type === 'concatenation') {
       finalKind = 'StringConcatenationUsedInUserFacingContext';
       finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
@@ -445,10 +495,10 @@ export class Scanner {
     } else if (traced.type === 'conditional') {
       finalKind = 'ConditionalStringUsedInUserFacingContext';
       finalConfidence = finalConfidence === 'ignored' ? 'ignored' : 'medium';
-      reason = 'Conditional expression contains multiple hardcoded strings';
+      reason = `${reason}; conditional source copy requires review`;
     }
 
-    const namespace = this.inferNamespace(relativeFilePath);
+    const namespace = this.inferBoundTranslationNamespace(node) ?? this.inferNamespace(relativeFilePath);
     const containingComponent = getContainingComponentName(node);
     let contextName = 'general';
     if (context.type === 'JSXAttribute' && context.elementName && /^[A-Z]/.test(context.elementName)) {
@@ -727,6 +777,28 @@ export class Scanner {
             }
           }
         }
+      }
+
+      for (const candidate of detectSemanticCandidates(sourceFile, relativePath, this.config)) {
+        const resolved = this.resolveExpression(candidate.node);
+        if (resolved.type === 'unknown' || resolved.type === 'object') continue;
+        const finding = this.buildFinding(
+          candidate.node,
+          resolved,
+          candidate.kind,
+          candidate.confidence,
+          candidate.reason,
+          candidate.context,
+          relativePath,
+          fileSuppressions
+        );
+        if (!finding) continue;
+        const duplicate = findings.slice(startIndex).some(existing =>
+          existing.line === finding.line &&
+          existing.column === finding.column &&
+          (existing.normalizedText ?? existing.rawText) === (finding.normalizedText ?? finding.rawText)
+        );
+        if (!duplicate) findings.push(finding);
       }
 
       if (this.config.scanErrors !== false) {
