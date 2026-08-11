@@ -261,7 +261,7 @@ program
 
 program
   .command('extract')
-  .description('Plan or merge source strings into routed locale catalogs')
+  .description('Plan or merge safe source strings into routed locale catalogs')
   .option('--locale <locale>', 'Catalog locale; defaults to configured source locale')
   .option('--merge', 'Write safe new entries to the catalog')
   .option('--dry-run', 'Never modify files')
@@ -279,7 +279,21 @@ program
 
     const report = scanner.scanFiles(targetFiles);
     const extractor = enrichTranslationCatalogStatus(config, report);
-    const plans = extractor.planCatalogs(report.findings, locale);
+    const extractable = report.findings.filter(
+      finding => finding.confidence !== 'ignored' && finding.fixability === 'safe'
+    );
+    const auditOnly = report.findings.filter(
+      finding => finding.confidence !== 'ignored' && finding.fixability !== 'safe'
+    );
+    if (auditOnly.length > 0) {
+      console.warn(`Skipping ${auditOnly.length} review-only/unsupported finding(s); they remain visible in scan reports and cannot write catalog entries.`);
+    }
+    if (extractable.length === 0) {
+      console.log('No safe catalog-extractable findings matched the requested scope.');
+      return;
+    }
+
+    const plans = extractor.planCatalogs(extractable, locale);
     reportCatalogPlans(plans);
 
     for (const plan of plans) {
@@ -287,7 +301,7 @@ program
         console.error(`Collision ${collision.key}: '${collision.oldValue}' vs '${collision.newValue}' (${collision.filePath})`);
       }
       for (const blocked of plan.report.blockedFindings) {
-        console.warn(`Review required ${blocked.filePath}: ${blocked.reason}`);
+        console.warn(`Blocked ${blocked.filePath}: ${blocked.reason}`);
       }
       for (const similar of plan.report.similarValues) {
         console.warn(`Similar source value ${similar.filePath}: '${similar.value}' already exists at '${similar.existingKey}', but automatic semantic reuse is disabled.`);
