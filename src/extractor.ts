@@ -357,17 +357,15 @@ export class Extractor {
   }
 
   private sourceValueForKey(key: string, plans: CatalogPlan[]): string | undefined {
-    const plan = plans.find(candidate => {
-      if (candidate.namespace) return routeMatchesKey({ namespace: candidate.namespace, messagesPath: '' }, key);
-      return !this.config.i18n.catalogRoutes?.some(route => routeMatchesKey(route, key));
-    });
+    const sourceTarget = this.resolveTargetForKey(key, this.config.i18n.sourceLocale);
+    if (sourceTarget.blockedReason) return undefined;
+    const plan = plans.find(candidate =>
+      candidate.catalogPath === sourceTarget.catalogPath &&
+      candidate.namespace === sourceTarget.namespace &&
+      candidate.stripNamespace === sourceTarget.stripNamespace
+    );
     if (!plan) return undefined;
-    const target: CatalogTarget = {
-      catalogPath: plan.catalogPath,
-      namespace: plan.namespace,
-      stripNamespace: plan.stripNamespace
-    };
-    const physical = this.physicalKey(key, target);
+    const physical = this.physicalKey(key, sourceTarget);
     if (!physical) return undefined;
     return this.parseCatalogContent(plan.outputContent, plan.catalogPath)[physical];
   }
