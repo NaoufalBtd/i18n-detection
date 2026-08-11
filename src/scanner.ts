@@ -11,6 +11,7 @@ import {
   type SourceFile,
   ts
 } from 'ts-morph';
+import { asArrayLiteral, unwrapExpression } from './ast-utils.js';
 import { CacheManager, hashContent } from './cache.js';
 import { detectSemanticCandidates } from './semantic-detectors.js';
 import { REPORT_SCHEMA_VERSION } from './version.js';
@@ -22,7 +23,8 @@ import type {
   UserFacingContext,
   ScanSummary,
   ScanReport,
-  FixStrategy
+  FixStrategy,
+  ExpressionKind
 } from './types.js';
 
 export interface FileSuppressions {
@@ -207,10 +209,30 @@ function expressionPlaceholder(expression: Node, index: number, used: Set<string
   return candidate;
 }
 
+const GENERIC_KEY_ROLES = new Set([
+  'title',
+  'subtitle',
+  'description',
+  'label',
+  'message',
+  'helperText',
+  'emptyText',
+  'header',
+  'footer',
+  'caption',
+  'tooltip',
+  'placeholder',
+  'actionLabel',
+  'ctaLabel',
+  'ariaLabel',
+  'aria-label'
+]);
+
 export class Scanner {
   private readonly config: ScannerConfig;
   private readonly projectRoot: string;
   private readonly project: Project;
+  private readonly translationNamespaceCache = new WeakMap<Node, string | null>();
 
   constructor(config: ScannerConfig, projectRoot = process.cwd()) {
     this.config = config;
@@ -282,6 +304,35 @@ export class Scanner {
     return 'common';
   }
 
+  private namespaceForScope(scope: Node): string | undefined {
+    if (this.translationNamespaceCache.has(scope)) {
+      return this.translationNamespaceCache.get(scope) ?? undefined;
+    }
+
+    const namespaces = new Set<string>();
+    for (const call of scope.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const owner = nearestFunctionScope(call);
+      if (Node.isSourceFile(scope)) {
+        if (owner) continue;
+      } else if (owner !== scope) {
+        continue;
+      }
+
+      const callee = call.getExpression().getText().replace(/\s+/g, '');
+      if (callee === this.config.i18n.clientHook || callee === this.config.i18n.serverAsyncFunction) {
+        const firstArg = call.getArguments()[0];
+        if (firstArg && Node.isStringLiteral(firstArg)) namespaces.add(firstArg.getLiteralValue());
+        continue;
+      }
+      const configured = this.config.semantic?.translationHooks[callee];
+      if (configured) namespaces.add(configured);
+    }
+
+    const resolved = namespaces.size === 1 ? [...namespaces][0] : null;
+    this.translationNamespaceCache.set(scope, resolved);
+    return resolved ?? undefined;
+  }
+
   private inferBoundTranslationNamespace(node: Node): string | undefined {
     const scopes: Node[] = [];
     let current = node.getParent();
@@ -292,21 +343,8 @@ export class Scanner {
     scopes.push(node.getSourceFile());
 
     for (const scope of scopes) {
-      const namespaces = new Set<string>();
-      for (const call of scope.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-        const owner = nearestFunctionScope(call);
-        if (Node.isSourceFile(scope)) {
-          if (owner) continue;
-        } else if (owner !== scope) {
-          continue;
-        }
-        const callee = call.getExpression().getText().replace(/\s+/g, '');
-        if (callee !== this.config.i18n.clientHook && callee !== this.config.i18n.serverAsyncFunction) continue;
-        const firstArg = call.getArguments()[0];
-        if (firstArg && Node.isStringLiteral(firstArg)) namespaces.add(firstArg.getLiteralValue());
-      }
-      if (namespaces.size === 1) return [...namespaces][0];
-      if (namespaces.size > 1) return undefined;
+      const namespace = this.namespaceForScope(scope);
+      if (namespace) return namespace;
     }
     return undefined;
   }
@@ -316,7 +354,12 @@ export class Scanner {
     if (trimmed in this.config.commonMappings) return this.config.commonMappings[trimmed];
 
     const context = contextName ? camelCase(contextName) : 'general';
-    let semantic = propOrKey ? camelCase(propOrKey) : camelCase(trimmed.slice(0, 40));
+    let semantic: string;
+    if (propOrKey && GENERIC_KEY_ROLES.has(propOrKey)) {
+      semantic = camelCase(`${trimmed.slice(0, 40)} ${propOrKey}`);
+    } else {
+      semantic = propOrKey ? camelCase(propOrKey) : camelCase(trimmed.slice(0, 40));
+    }
     if (!semantic) semantic = `text${shortHash(trimmed).slice(0, 8)}`;
     return `${namespace}.${context || 'general'}.${semantic}`;
   }
@@ -333,6 +376,9 @@ export class Scanner {
   private resolveExpression(node: Node, visited = new Set<Node>()): TracedValue {
     if (visited.has(node)) return { type: 'unknown', node };
     visited.add(node);
+
+    const unwrapped = unwrapExpression(node);
+    if (unwrapped !== node) return this.resolveExpression(unwrapped, visited);
 
     if (Node.isStringLiteral(node) || Node.isNoSubstitutionTemplateLiteral(node)) {
       return { type: 'string', value: node.getLiteralValue(), node };
@@ -439,7 +485,8 @@ export class Scanner {
     reason: string,
     context: UserFacingContext,
     relativeFilePath: string,
-    suppressions: FileSuppressions
+    suppressions: FileSuppressions,
+    semanticRule?: string
   ): Finding | null {
     const sourceFile = node.getSourceFile();
     const start = sourceFile.getLineAndColumnAtPos(node.getStart());
@@ -467,6 +514,15 @@ export class Scanner {
     let finalKind = kind;
     let declarationLocation: Finding['declarationLocation'];
     let usageLocation: Finding['usageLocation'];
+    let expressionKind: ExpressionKind = traced.type === 'string'
+      ? 'literal'
+      : traced.type === 'template_literal'
+        ? 'template'
+        : traced.type === 'concatenation'
+          ? 'concatenation'
+          : traced.type === 'conditional'
+            ? 'conditional'
+            : 'unknown';
 
     if (traced.declarationNode) {
       const declarationFile = traced.declarationNode.getSourceFile();
@@ -477,6 +533,7 @@ export class Scanner {
         column: declarationStart.column
       };
       usageLocation = { file: relativeFilePath, line: start.line, column: start.column };
+      expressionKind = traced.propertyName ? 'object-property' : 'constant';
       finalKind = traced.propertyName
         ? 'LocalObjectPropertyUsedInUserFacingContext'
         : 'LocalConstUsedInUserFacingContext';
@@ -550,6 +607,8 @@ export class Scanner {
       normalizedText,
       texts,
       kind: finalKind,
+      rule: semanticRule,
+      expressionKind,
       confidence: finalConfidence,
       reason,
       userFacingContext: context,
@@ -754,11 +813,12 @@ export class Scanner {
           const variableName = variable.getName();
           const typeName = variable.getTypeNode()?.getText() ?? '';
           const initializer = variable.getInitializer();
-          if (!initializer || !Node.isArrayLiteralExpression(initializer)) continue;
+          const array = initializer ? asArrayLiteral(initializer) : undefined;
+          if (!array) continue;
           const recognizedUiConfig =
             this.config.uiConfigVariables?.includes(variableName) || this.config.uiConfigTypes?.includes(typeName);
 
-          for (const element of initializer.getElements()) {
+          for (const element of array.getElements()) {
             const resolved = this.resolveExpression(element);
             if (resolved.type !== 'object' || !resolved.properties) continue;
             for (const [propName, propValue] of Object.entries(resolved.properties)) {
@@ -790,9 +850,14 @@ export class Scanner {
           candidate.reason,
           candidate.context,
           relativePath,
-          fileSuppressions
+          fileSuppressions,
+          candidate.rule
         );
         if (!finding) continue;
+        finding.translationNamespace = candidate.translationNamespace;
+        finding.referencedTranslationKey = candidate.referencedTranslationKey;
+        finding.resolvedTranslationKey = candidate.resolvedTranslationKey;
+        finding.fallbackValue = candidate.fallbackValue;
         const duplicate = findings.slice(startIndex).some(existing =>
           existing.line === finding.line &&
           existing.column === finding.column &&
