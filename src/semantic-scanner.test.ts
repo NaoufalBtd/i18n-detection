@@ -4,6 +4,20 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { DEFAULT_CONFIG } from './config.js';
 import { Scanner } from './scanner.js';
+import type { ScannerConfig } from './types.js';
+
+function configWithTranslationHooks(): ScannerConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    semantic: {
+      ...DEFAULT_CONFIG.semantic!,
+      translationHooks: {
+        useProductTranslations: 'products',
+        useCommonTranslations: 'ui.common'
+      }
+    }
+  };
+}
 
 describe('semantic scanner coverage', () => {
   it('detects custom translation fallbacks without treating them as violations safe to fix', () => {
@@ -11,20 +25,23 @@ describe('semantic scanner coverage', () => {
     const report = scanner.scanInMemory('apps/web/src/storefront/ProductPurchaseIsland.tsx', `
       export function ProductPurchaseIsland() {
         const translations = { t: (_key: string, fallback: string) => fallback };
-        const t = (key: string, fallback: string) => translations.t(key, fallback);
-        return <button>{t('actions.buyNow', 'Buy now')}</button>;
+        return <button>{translations.t('actions.buyNow', 'Buy now')}</button>;
       }
     `);
     const finding = report.findings.find(item => item.kind === 'TranslationFallback');
     expect(finding?.rawText).toBe('Buy now');
+    expect(finding?.referencedTranslationKey).toBe('actions.buyNow');
+    expect(finding?.fallbackValue).toBe('Buy now');
     expect(finding?.confidence).toBe('low');
     expect(finding?.autoFixCandidate).toBe(false);
   });
 
-  it('detects next-intl defaultValue source copy', () => {
+  it('resolves next-intl defaultValue findings to the full runtime translation key', () => {
     const scanner = new Scanner(DEFAULT_CONFIG);
     const report = scanner.scanInMemory('apps/web/src/storefront/useProductListingTranslations.ts', `
-      export function useProductListingTranslations(t: any) {
+      declare function useTranslations(namespace: string): (key: string, options?: unknown) => string;
+      export function useProductListingTranslations() {
+        const t = useTranslations('products.listing');
         return {
           searchAction: t('searchAction', { defaultValue: 'Search products' }),
           results: t('results', { count: 2, defaultValue: '{count} products' })
@@ -33,7 +50,25 @@ describe('semantic scanner coverage', () => {
     `);
     const defaults = report.findings.filter(item => item.kind === 'TranslationDefaultValue');
     expect(defaults.map(item => item.rawText)).toEqual(['Search products', '{count} products']);
+    expect(defaults.map(item => item.resolvedTranslationKey)).toEqual([
+      'products.listing.searchAction',
+      'products.listing.results'
+    ]);
+    expect(defaults.every(item => item.translationNamespace === 'products.listing')).toBe(true);
     expect(defaults.every(item => item.confidence === 'low')).toBe(true);
+  });
+
+  it('uses configured specialized translation hooks for namespace inference', () => {
+    const scanner = new Scanner(configWithTranslationHooks());
+    const report = scanner.scanInMemory('apps/web/src/storefront/ProductActions.tsx', `
+      declare function useProductTranslations(): { addToCart: string };
+      export function ProductActions() {
+        const { addToCart } = useProductTranslations();
+        return <button title="Buy this product">{addToCart}</button>;
+      }
+    `);
+    const finding = report.findings.find(item => item.rawText === 'Buy this product');
+    expect(finding?.suggestedKey?.startsWith('products.')).toBe(true);
   });
 
   it('detects hardcoded copy hidden behind translation-shaped object hooks', () => {
@@ -91,6 +126,54 @@ describe('semantic scanner coverage', () => {
     expect(texts).toEqual(expect.arrayContaining(['Category', 'Lifecycle', 'Actions']));
   });
 
+  it('detects MediaShopping-style as const UI registries', () => {
+    const scanner = new Scanner(DEFAULT_CONFIG);
+    const report = scanner.scanInMemory('packages/contracts/src/v1/schemas/category-form.ts', `
+      export const CATEGORY_TYPE_OPTIONS = [
+        { value: 'STANDARD', label: 'Standard', description: 'Core browse taxonomy for shoppers' },
+        { value: 'CAMPAIGN', label: 'Campaign', description: 'Time-bound marketing collections' }
+      ] as const;
+      export const PUBLISHING_UI_STATES = {
+        DRAFT: { label: 'Draft', description: 'Draft categories are safe to edit.', chipColor: 'default' },
+        ACTIVE: { label: 'Published', description: 'Published categories appear to customers.', chipColor: 'success' }
+      } as const;
+    `);
+    const registry = report.findings.filter(item => item.kind === 'StaticUiRegistryString');
+    expect(registry.map(item => item.rawText)).toEqual(expect.arrayContaining([
+      'Standard',
+      'Core browse taxonomy for shoppers',
+      'Campaign',
+      'Draft',
+      'Draft categories are safe to edit.',
+      'Published'
+    ]));
+    expect(registry.some(item => item.rawText === 'default')).toBe(false);
+    expect(registry.every(item => item.rule === 'i18n/static-ui-registry')).toBe(true);
+  });
+
+  it('unwraps as const satisfies registries recursively', () => {
+    const scanner = new Scanner(DEFAULT_CONFIG);
+    const report = scanner.scanInMemory('packages/contracts/src/v1/data/banner-family-definitions.ts', `
+      interface Definition { label: string; description: string; variants: readonly { label: string; description: string }[] }
+      export const BANNER_FAMILY_DEFINITIONS = [
+        {
+          label: 'Hero',
+          description: 'Static hero banner templates.',
+          variants: [{ label: 'Variant A', description: 'Text left with media background.' }]
+        }
+      ] as const satisfies readonly Definition[];
+    `);
+    const values = report.findings
+      .filter(item => item.kind === 'StaticUiRegistryString')
+      .map(item => item.rawText);
+    expect(values).toEqual(expect.arrayContaining([
+      'Hero',
+      'Static hero banner templates.',
+      'Variant A',
+      'Text left with media background.'
+    ]));
+  });
+
   it('detects inline locale maps as migration smells', () => {
     const scanner = new Scanner(DEFAULT_CONFIG);
     const report = scanner.scanInMemory('apps/web/src/storefront/BuyerAddressForm.tsx', `
@@ -98,7 +181,7 @@ describe('semantic scanner coverage', () => {
         en: { Home: 'Home', Work: 'Work' },
         fr: { Home: 'Domicile', Work: 'Travail' },
         ar: { Home: 'المنزل', Work: 'العمل' }
-      };
+      } as const;
       export function BuyerAddressForm() { return <div />; }
     `);
     const inline = report.findings.filter(item => item.kind === 'InlineLocaleCatalogString');
@@ -106,24 +189,37 @@ describe('semantic scanner coverage', () => {
     expect(inline.some(item => item.rawText === 'Travail')).toBe(true);
   });
 
-  it('detects zod-style validation messages but ignores technical defaults', () => {
+  it('detects Zod validation messages and user-facing defaults while ignoring technical defaults', () => {
     const scanner = new Scanner(DEFAULT_CONFIG);
-    const report = scanner.scanInMemory('packages/contracts/src/v1/schemas/user.ts', `
-      const z: any = {};
-      const schema = z.string()
-        .min(1, 'First name is required')
-        .max(50, 'First name too long')
-        .default('en');
-      const refined = z.object({}).refine(() => false, {
-        message: 'Passwords do not match',
-        path: ['confirmPassword']
+    const report = scanner.scanInMemory('packages/contracts/src/v1/schemas/section-registry.ts', `
+      import { z } from 'zod';
+      export const SectionSchema = z.object({
+        title: z.string().min(1, 'Title is required').default('Shop curated collections'),
+        layout: z.enum(['grid', 'list']).default('grid'),
+        status: z.enum(['active', 'inactive']).default('active'),
+        items: z.array(z.object({ label: z.string(), description: z.string() })).default([
+          { label: 'Fast delivery', description: 'Reliable shipping with clear delivery windows.' },
+          { label: 'Easy returns', description: 'Simple return support for confident shopping.' }
+        ])
+      });
+      export const PasswordSchema = z.object({ password: z.string() }).refine(() => false, {
+        message: 'Passwords do not match'
       });
     `);
     const validation = report.findings.filter(item => item.kind === 'ValidationMessage');
     expect(validation.map(item => item.rawText)).toEqual(
-      expect.arrayContaining(['First name is required', 'First name too long', 'Passwords do not match'])
+      expect.arrayContaining(['Title is required', 'Passwords do not match'])
     );
-    expect(report.findings.some(item => item.rawText === 'en')).toBe(false);
+    const defaults = report.findings.filter(item => item.kind === 'SchemaDefaultString');
+    expect(defaults.map(item => item.rawText)).toEqual(expect.arrayContaining([
+      'Shop curated collections',
+      'Fast delivery',
+      'Reliable shipping with clear delivery windows.',
+      'Easy returns',
+      'Simple return support for confident shopping.'
+    ]));
+    expect(report.findings.some(item => item.rawText === 'grid')).toBe(false);
+    expect(report.findings.some(item => item.rawText === 'active')).toBe(false);
   });
 
   it('detects hardcoded Next.js metadata including templated titles', () => {
@@ -150,7 +246,21 @@ describe('semantic scanner coverage', () => {
     `);
     const finding = report.findings.find(item => item.userFacingContext?.type === 'TranslatedLiteralFragment');
     expect(finding?.kind).toBe('TemplateLiteralUsedInUserFacingContext');
+    expect(finding?.expressionKind).toBe('template');
     expect(finding?.confidence).toBe('medium');
+  });
+
+  it('generates distinct semantic keys for repeated generic prop roles', () => {
+    const scanner = new Scanner(DEFAULT_CONFIG);
+    const report = scanner.scanInMemory('apps/web/src/ProfileForm.tsx', `
+      export function ProfileForm() {
+        return <><input placeholder="First name" /><input placeholder="Last name" /></>;
+      }
+    `);
+    const placeholders = report.findings.filter(item => item.userFacingContext?.propName === 'placeholder');
+    expect(placeholders).toHaveLength(2);
+    expect(new Set(placeholders.map(item => item.suggestedKey)).size).toBe(2);
+    expect(placeholders[0].suggestedKey).not.toBe(placeholders[1].suggestedKey);
   });
 
   it('discovers js/jsx plus monorepo app and package source roots by default', async () => {
