@@ -63,7 +63,7 @@ describe('project-level codemod validation', () => {
 
       expect(result.success).toBe(true);
       expect(result.modified).toBe(true);
-      expect(result.plannedContent).toContain("from 'next-intl'");
+      expect(result.plannedContent).toMatch(/from ["']next-intl["']/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
