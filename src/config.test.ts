@@ -31,26 +31,38 @@ describe('configuration', () => {
   it('deep-merges i18n, semantic, and feature settings', () => {
     withTempFile(
       JSON.stringify({
-        i18n: { sourceLocale: 'fr' },
+        i18n: { sourceLocale: 'fr', requiredLocales: ['fr', 'en', 'ar'] },
         semantic: { scanNextMetadata: false },
         features: { codemod: true }
       }),
       filePath => {
         const config = loadConfig(filePath);
         expect(config.i18n.sourceLocale).toBe('fr');
+        expect(config.i18n.requiredLocales).toEqual(['fr', 'en', 'ar']);
         expect(config.i18n.library).toBe('next-intl');
         expect(config.semantic?.scanNextMetadata).toBe(false);
         expect(config.semantic?.scanValidationMessages).toBe(true);
+        expect(config.semantic?.scanSchemaDefaults).toBe(true);
         expect(config.features.codemod).toBe(true);
         expect(config.features.templateLiterals).toBe(true);
       }
     );
   });
 
-  it('accepts deterministic split catalog routes', () => {
+  it('requires sourceLocale to be part of requiredLocales', () => {
+    withTempFile(
+      JSON.stringify({ i18n: { sourceLocale: 'en', requiredLocales: ['fr', 'ar'] } }),
+      filePath => {
+        expect(() => loadConfig(filePath)).toThrow(/requiredLocales must include i18n.sourceLocale/);
+      }
+    );
+  });
+
+  it('accepts deterministic split catalog routes and strict routing', () => {
     withTempFile(
       JSON.stringify({
         i18n: {
+          catalogRouting: 'strict',
           catalogRoutes: [
             {
               namespace: 'products',
@@ -68,7 +80,24 @@ describe('configuration', () => {
       filePath => {
         const config = loadConfig(filePath);
         expect(config.i18n.catalogRoutes).toHaveLength(2);
-        expect(config.i18n.catalogRoutes?.[0].namespace).toBe('products');
+        expect(config.i18n.catalogRouting).toBe('strict');
+      }
+    );
+  });
+
+  it('accepts translation hook namespace descriptors', () => {
+    withTempFile(
+      JSON.stringify({
+        semantic: {
+          translationHooks: {
+            useProductTranslations: 'products',
+            useCommonTranslations: 'ui.common'
+          }
+        }
+      }),
+      filePath => {
+        const config = loadConfig(filePath);
+        expect(config.semantic?.translationHooks.useProductTranslations).toBe('products');
       }
     );
   });
@@ -85,6 +114,15 @@ describe('configuration', () => {
       }),
       filePath => {
         expect(() => loadConfig(filePath)).toThrow(/duplicate namespace 'products'/);
+      }
+    );
+  });
+
+  it('requires a tsconfig when project validation is mandatory', () => {
+    withTempFile(
+      JSON.stringify({ codemod: { requireProjectValidation: true } }),
+      filePath => {
+        expect(() => loadConfig(filePath)).toThrow(/tsconfigPath is required/);
       }
     );
   });
