@@ -5,6 +5,7 @@ export type FindingKind =
   | 'JSXAttribute'
   | 'KnownComponentProp'
   | 'KnownFunctionArgument'
+  | 'StateMessage'
   | 'LocalConstUsedInUserFacingContext'
   | 'LocalObjectPropertyUsedInUserFacingContext'
   | 'ConditionalStringUsedInUserFacingContext'
@@ -13,14 +14,27 @@ export type FindingKind =
   | 'TranslationFallback'
   | 'TranslationDefaultValue'
   | 'PresentationObjectString'
+  | 'StaticUiRegistryString'
+  | 'SchemaDefaultString'
   | 'InlineLocaleCatalogString'
   | 'ValidationMessage'
   | 'NextMetadataString'
   | 'ErrorString'
   | 'AmbiguousString';
 
+export type ExpressionKind =
+  | 'literal'
+  | 'template'
+  | 'concatenation'
+  | 'conditional'
+  | 'constant'
+  | 'object-property'
+  | 'unknown';
+
 export type Fixability = 'safe' | 'review' | 'unsupported';
 export type FixStrategy = 'replace-jsx-text' | 'replace-jsx-attribute';
+export type CatalogRoutingMode = 'fallback' | 'strict';
+export type TranslationCatalogStatus = 'present' | 'missing' | 'source-mismatch';
 
 export interface UserFacingContext {
   type: string;
@@ -43,6 +57,8 @@ export interface Finding {
   normalizedText?: string;
   texts?: string[];
   kind: FindingKind;
+  rule?: string;
+  expressionKind?: ExpressionKind;
   confidence: Confidence;
   reason: string;
   userFacingContext?: UserFacingContext;
@@ -69,6 +85,12 @@ export interface Finding {
   };
   variables?: string[];
   interpolationExpressions?: Record<string, string>;
+  translationNamespace?: string;
+  referencedTranslationKey?: string;
+  resolvedTranslationKey?: string;
+  fallbackValue?: string;
+  catalogStatus?: TranslationCatalogStatus;
+  catalogStatusReason?: string;
 }
 
 export type CodemodFramework = 'next-intl' | 'react-i18next' | 'generic';
@@ -81,6 +103,7 @@ export interface CatalogRoute {
 
 export interface TranslationApiRule {
   callee: string;
+  keyArgument?: number;
   fallbackArgument?: number;
   optionsArgument?: number;
   defaultValueProperty?: string;
@@ -88,11 +111,19 @@ export interface TranslationApiRule {
 
 export interface SemanticScanConfig {
   translationApis: TranslationApiRule[];
+  translationHooks: Record<string, string>;
   presentationFilePatterns: string[];
   presentationFunctionPatterns: string[];
   presentationObjectKeys: string[];
   translationObjectVariables: string[];
+  presentationInclude: string[];
+  staticRegistryVariablePatterns: string[];
+  staticRegistryObjectKeys: string[];
+  staticRegistryInclude: string[];
   inlineLocaleKeys: string[];
+  validationInclude: string[];
+  schemaDefaultKeys: string[];
+  scanSchemaDefaults: boolean;
   scanValidationMessages: boolean;
   scanNextMetadata: boolean;
 }
@@ -103,11 +134,13 @@ export interface ScannerConfig {
   i18n: {
     library: string;
     sourceLocale: string;
+    requiredLocales: string[];
     translationFunctionName: string;
     clientHook: string;
     serverAsyncFunction: string;
     messagesPath: string;
     catalogRoutes?: CatalogRoute[];
+    catalogRouting: CatalogRoutingMode;
     catalogFormat: 'nested-json' | 'flat-json';
     keyStyle: string;
   };
@@ -136,6 +169,8 @@ export interface ScannerConfig {
   };
   codemod?: {
     framework?: CodemodFramework;
+    tsconfigPath?: string;
+    requireProjectValidation?: boolean;
   };
 }
 

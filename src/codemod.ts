@@ -1,10 +1,12 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   Project,
   SyntaxKind,
   Node,
-  type SourceFile,
   type Block,
+  type Diagnostic,
+  type SourceFile,
   ts
 } from 'ts-morph';
 import type { Finding, ScannerConfig, Confidence } from './types.js';
@@ -182,9 +184,137 @@ function validateSyntax(filePath: string, content: string): string | undefined {
   });
   const errors = (result.diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error);
   if (errors.length === 0) return undefined;
-  return errors
-    .map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
-    .join('; ');
+  return errors.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')).join('; ');
+}
+
+function diagnosticMessage(diagnostic: Diagnostic): string {
+  return ts.flattenDiagnosticMessageText(diagnostic.compilerObject.messageText, '\n');
+}
+
+function diagnosticIdentity(diagnostic: Diagnostic): string {
+  const source = diagnostic.getSourceFile();
+  return JSON.stringify({
+    code: diagnostic.getCode(),
+    file: source?.getFilePath() ?? '',
+    message: diagnosticMessage(diagnostic)
+  });
+}
+
+function diagnosticCounts(diagnostics: Diagnostic[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const diagnostic of diagnostics) {
+    const identity = diagnosticIdentity(diagnostic);
+    counts.set(identity, (counts.get(identity) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function newlyIntroducedDiagnostics(before: Map<string, number>, after: Diagnostic[]): Diagnostic[] {
+  const remaining = new Map(before);
+  const introduced: Diagnostic[] = [];
+  for (const diagnostic of after) {
+    const identity = diagnosticIdentity(diagnostic);
+    const count = remaining.get(identity) ?? 0;
+    if (count > 0) {
+      if (count === 1) remaining.delete(identity);
+      else remaining.set(identity, count - 1);
+    } else {
+      introduced.push(diagnostic);
+    }
+  }
+  return introduced;
+}
+
+function projectDiagnosticsByResult(
+  project: Project,
+  projectRoot: string,
+  results: CodemodResult[]
+): Map<string, Diagnostic[]> {
+  const resultByAbsolutePath = new Map(
+    results.map(result => [path.resolve(projectRoot, result.filePath), result.filePath] as const)
+  );
+  const grouped = new Map(results.map(result => [result.filePath, [] as Diagnostic[]] as const));
+
+  for (const diagnostic of project.getPreEmitDiagnostics()) {
+    const source = diagnostic.getSourceFile();
+    if (!source) continue;
+    const resultPath = resultByAbsolutePath.get(path.resolve(source.getFilePath()));
+    if (!resultPath) continue;
+    grouped.get(resultPath)!.push(diagnostic);
+  }
+  return grouped;
+}
+
+function validateProjectChanges(
+  config: ScannerConfig,
+  projectRoot: string,
+  results: CodemodResult[]
+): void {
+  const tsconfigPath = config.codemod?.tsconfigPath;
+  if (!tsconfigPath) return;
+
+  const resolvedTsconfig = path.resolve(projectRoot, tsconfigPath);
+  const modified = results.filter(result => result.modified && result.plannedContent !== undefined);
+  if (modified.length === 0) return;
+
+  try {
+    if (!fs.existsSync(resolvedTsconfig)) {
+      throw new Error(`Configured tsconfig was not found: ${resolvedTsconfig}`);
+    }
+    const project = new Project({ tsConfigFilePath: resolvedTsconfig });
+    const baselineDiagnostics = projectDiagnosticsByResult(project, projectRoot, modified);
+    const baseline = new Map(
+      modified.map(result => [
+        result.filePath,
+        diagnosticCounts(baselineDiagnostics.get(result.filePath) ?? [])
+      ] as const)
+    );
+
+    for (const result of modified) {
+      const absoluteFile = path.resolve(projectRoot, result.filePath);
+      project.createSourceFile(absoluteFile, result.plannedContent!, { overwrite: true });
+    }
+
+    const plannedDiagnostics = projectDiagnosticsByResult(project, projectRoot, modified);
+    for (const result of modified) {
+      const introduced = newlyIntroducedDiagnostics(
+        baseline.get(result.filePath) ?? new Map<string, number>(),
+        plannedDiagnostics.get(result.filePath) ?? []
+      );
+      if (introduced.length === 0) continue;
+
+      result.success = false;
+      result.modified = false;
+      result.plannedContent = undefined;
+      result.error = `Project TypeScript validation introduced ${introduced.length} diagnostic(s): ${introduced
+        .slice(0, 5)
+        .map(diagnostic => `${diagnostic.getCode()}: ${diagnosticMessage(diagnostic)}`)
+        .join('; ')}`;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const result of modified) {
+      result.success = false;
+      result.modified = false;
+      result.plannedContent = undefined;
+      result.error = `Project TypeScript validation failed: ${message}`;
+    }
+  }
+}
+
+function keyForBinding(globalKey: string, binding: TranslationBinding): { key?: string; reason?: string } {
+  if (binding.type !== 'known' || !binding.namespace) return { key: globalKey };
+  const prefix = `${binding.namespace}.`;
+  if (!globalKey.startsWith(prefix)) {
+    return {
+      reason: `Existing translator is scoped to namespace '${binding.namespace}', but planned key '${globalKey}' is outside that namespace`
+    };
+  }
+  const relative = globalKey.slice(prefix.length);
+  if (!relative) {
+    return { reason: `Planned key '${globalKey}' has no namespace-relative segment` };
+  }
+  return { key: relative };
 }
 
 export function selectFixableFindings(findings: Finding[], options: Pick<CodemodOptions, 'confidence' | 'findingId'>): Finding[] {
@@ -240,9 +370,7 @@ export class CodemodEngine {
       const fileFindings = byFile.get(relativePath);
       if (!fileFindings?.length) continue;
 
-      const project = new Project({
-        compilerOptions: { allowJs: true, jsx: ts.JsxEmit.ReactJSX }
-      });
+      const project = new Project({ compilerOptions: { allowJs: true, jsx: ts.JsxEmit.ReactJSX } });
       const sourceFile = project.addSourceFileAtPath(absoluteFile);
       const result: CodemodResult = {
         filePath: relativePath,
@@ -257,7 +385,7 @@ export class CodemodEngine {
           .map(finding => ({ finding, node: findNodeAtLineAndColumn(sourceFile, finding.line, finding.column) }))
           .sort((a, b) => b.finding.line - a.finding.line || b.finding.column - a.finding.column);
         const injections = new Map<Block, PlannedInjection>();
-        const plannedTargets: { finding: Finding; node: Node; key: string }[] = [];
+        const plannedTargets: { finding: Finding; node: Node; globalKey: string; callKey: string }[] = [];
 
         for (const target of targets) {
           const { finding, node } = target;
@@ -266,22 +394,24 @@ export class CodemodEngine {
             continue;
           }
 
-          const key = options.keyOverrides?.[finding.id] ?? finding.suggestedKey;
-          if (!key) {
+          const globalKey = options.keyOverrides?.[finding.id] ?? finding.suggestedKey;
+          if (!globalKey) {
             result.blocked.push({ findingId: finding.id, reason: 'No catalog key is available for this finding' });
             continue;
           }
 
           const binding = findVisibleTranslationBinding(node, this.config);
           if (binding.type === 'unknown') {
-            result.blocked.push({ findingId: finding.id, reason: `A '${this.config.i18n.translationFunctionName}' binding exists but is not a recognized next-intl translator` });
-            continue;
-          }
-          if (binding.type === 'known' && binding.namespace) {
             result.blocked.push({
               findingId: finding.id,
-              reason: `Existing translator is scoped to namespace '${binding.namespace}'; generated global keys are not rewritten across namespace boundaries automatically`
+              reason: `A '${this.config.i18n.translationFunctionName}' binding exists but is not a recognized next-intl translator`
             });
+            continue;
+          }
+
+          const boundKey = keyForBinding(globalKey, binding);
+          if (!boundKey.key) {
+            result.blocked.push({ findingId: finding.id, reason: boundKey.reason ?? 'Unable to resolve translation key for visible binding' });
             continue;
           }
 
@@ -309,18 +439,18 @@ export class CodemodEngine {
             injections.set(component.block, { block: component.block, async: component.async });
           }
 
-          plannedTargets.push({ finding, node, key });
+          plannedTargets.push({ finding, node, globalKey, callKey: boundKey.key });
         }
 
         for (const target of plannedTargets) {
-          const { finding, node, key } = target;
+          const { finding, node, callKey } = target;
           const tName = this.config.i18n.translationFunctionName;
           const originalLine = sourceFile.getFullText().split(/\r?\n/)[finding.line - 1] ?? '';
           let replacement: string;
           if (finding.fixStrategy === 'replace-jsx-text') {
-            replacement = `{${tName}("${key}")}`;
+            replacement = `{${tName}("${callKey}")}`;
           } else if (finding.fixStrategy === 'replace-jsx-attribute') {
-            replacement = Node.isJsxExpression(node.getParent()) ? `${tName}("${key}")` : `{${tName}("${key}")}`;
+            replacement = Node.isJsxExpression(node.getParent()) ? `${tName}("${callKey}")` : `{${tName}("${callKey}")}`;
           } else {
             result.blocked.push({ findingId: finding.id, reason: `Unsupported fix strategy '${finding.fixStrategy ?? 'none'}'` });
             continue;
@@ -361,6 +491,7 @@ export class CodemodEngine {
       }
     }
 
+    validateProjectChanges(this.config, this.projectRoot, results);
     return results;
   }
 

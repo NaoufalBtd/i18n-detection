@@ -29,10 +29,20 @@ export interface CatalogPlan {
   changed: boolean;
 }
 
+export interface LocaleParityIssue {
+  findingId?: string;
+  key: string;
+  locale: string;
+  catalogPath?: string;
+  reason: string;
+  kind: 'missing-key' | 'placeholder-mismatch' | 'unroutable';
+}
+
 interface CatalogTarget {
   catalogPath: string;
   namespace?: string;
   stripNamespace: boolean;
+  blockedReason?: string;
 }
 
 function emptyReport(): CollisionReport {
@@ -102,6 +112,16 @@ function routeMatchesKey(route: CatalogRoute, key: string): boolean {
   return key === route.namespace || key.startsWith(`${route.namespace}.`);
 }
 
+function placeholderNames(value: string): Set<string> {
+  const names = new Set<string>();
+  for (const match of value.matchAll(/\{\s*([a-zA-Z_][\w]*)\s*(?:[,}])/g)) names.add(match[1]);
+  return names;
+}
+
+function sameSet(left: Set<string>, right: Set<string>): boolean {
+  return left.size === right.size && [...left].every(value => right.has(value));
+}
+
 export class Extractor {
   private readonly config: ScannerConfig;
   private readonly projectRoot: string;
@@ -133,10 +153,19 @@ export class Extractor {
       .sort((a, b) => b.namespace.length - a.namespace.length || a.namespace.localeCompare(b.namespace));
     const route = routes[0];
     if (!route) {
-      return {
+      const fallback = {
         catalogPath: this.resolveCatalogPath(locale),
         stripNamespace: false
       };
+      if ((this.config.i18n.catalogRoutes?.length ?? 0) > 0 && this.config.i18n.catalogRouting === 'strict') {
+        return {
+          ...fallback,
+          blockedReason: key
+            ? `No catalog route matches translation key '${key}' while i18n.catalogRouting is strict`
+            : 'Finding has no translation key and cannot be routed while i18n.catalogRouting is strict'
+        };
+      }
+      return fallback;
     }
     return {
       catalogPath: this.resolveConfiguredPath(
@@ -161,11 +190,10 @@ export class Extractor {
     return physicalKey ? `${target.namespace}.${physicalKey}` : target.namespace;
   }
 
-  private readCatalog(catalogPath: string): Record<string, string> {
-    if (!fs.existsSync(catalogPath)) return {};
+  private parseCatalogContent(content: string, catalogPath: string): Record<string, string> {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(fs.readFileSync(catalogPath, 'utf8')) as unknown;
+      parsed = JSON.parse(content) as unknown;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to parse existing catalog at ${catalogPath}: ${message}`);
@@ -173,6 +201,11 @@ export class Extractor {
     return this.config.i18n.catalogFormat === 'nested-json'
       ? flattenObject(parsed)
       : validateFlatCatalog(parsed);
+  }
+
+  private readCatalog(catalogPath: string): Record<string, string> {
+    if (!fs.existsSync(catalogPath)) return {};
+    return this.parseCatalogContent(fs.readFileSync(catalogPath, 'utf8'), catalogPath);
   }
 
   private serializeCatalog(catalog: Record<string, string>): string {
@@ -201,6 +234,10 @@ export class Extractor {
       .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.line - b.line || a.column - b.column);
 
     for (const finding of activeFindings) {
+      if (target.blockedReason) {
+        report.blockedFindings.push({ findingId: finding.id, filePath: finding.filePath, reason: target.blockedReason });
+        continue;
+      }
       if (finding.fixability !== 'safe') {
         report.blockedFindings.push({
           findingId: finding.id,
@@ -209,7 +246,6 @@ export class Extractor {
         });
         continue;
       }
-
       if (finding.texts && finding.texts.length > 1) {
         report.blockedFindings.push({
           findingId: finding.id,
@@ -240,47 +276,11 @@ export class Extractor {
         continue;
       }
 
-      const normalizedValue = text.trim();
-      const reusableKeys = exactValueToKeys.get(text);
-      if (reusableKeys && reusableKeys.length > 0) {
-        const existingKey = reusableKeys[0];
-        keyByFindingId[finding.id] = existingKey;
-        finding.existingSimilarKey = existingKey;
-        if (existingKey === suggestedKey) {
-          report.existingMatches.push({ key: existingKey, value: text, filePath: finding.filePath, findingId: finding.id });
-        } else {
-          report.similarValues.push({
-            key: suggestedKey,
-            value: text,
-            existingKey,
-            filePath: finding.filePath,
-            findingId: finding.id
-          });
-        }
-        continue;
-      }
-
-      const normalizedMatches = normalizedValueToKeys.get(normalizedValue);
-      if (normalizedMatches && normalizedMatches.length > 0) {
-        report.similarValues.push({
-          key: suggestedKey,
-          value: text,
-          existingKey: normalizedMatches[0],
-          filePath: finding.filePath,
-          findingId: finding.id
-        });
-      }
-
       const reservedValue = plannedCatalog[physicalSuggestedKey];
       if (reservedValue !== undefined) {
         if (reservedValue === text) {
           keyByFindingId[finding.id] = suggestedKey;
-          report.existingMatches.push({
-            key: suggestedKey,
-            value: text,
-            filePath: finding.filePath,
-            findingId: finding.id
-          });
+          report.existingMatches.push({ key: suggestedKey, value: text, filePath: finding.filePath, findingId: finding.id });
         } else {
           report.keyCollisions.push({
             key: suggestedKey,
@@ -293,9 +293,26 @@ export class Extractor {
         continue;
       }
 
+      // Same English text is only advisory. Two source strings may require different
+      // translations by grammatical role or product context, so value equality alone
+      // must never override the deterministic suggested key.
+      const exactMatches = exactValueToKeys.get(text) ?? [];
+      const normalizedMatches = normalizedValueToKeys.get(text.trim()) ?? [];
+      const similar = exactMatches[0] ?? normalizedMatches[0];
+      if (similar && similar !== suggestedKey) {
+        finding.existingSimilarKey = similar;
+        report.similarValues.push({
+          key: suggestedKey,
+          value: text,
+          existingKey: similar,
+          filePath: finding.filePath,
+          findingId: finding.id
+        });
+      }
+
       plannedCatalog[physicalSuggestedKey] = text;
-      exactValueToKeys.set(text, [suggestedKey]);
-      normalizedValueToKeys.set(normalizedValue, [...(normalizedValueToKeys.get(normalizedValue) ?? []), suggestedKey]);
+      exactValueToKeys.set(text, [...exactMatches, suggestedKey]);
+      normalizedValueToKeys.set(text.trim(), [...normalizedMatches, suggestedKey]);
       keyByFindingId[finding.id] = suggestedKey;
       report.newEntries.push({ key: suggestedKey, value: text, filePath: finding.filePath, findingId: finding.id });
     }
@@ -317,7 +334,7 @@ export class Extractor {
     const groups = new Map<string, { target: CatalogTarget; findings: Finding[] }>();
     for (const finding of findings) {
       const target = this.resolveTargetForKey(finding.suggestedKey, locale);
-      const identity = `${target.catalogPath}\u0000${target.namespace ?? ''}\u0000${target.stripNamespace ? '1' : '0'}`;
+      const identity = `${target.catalogPath}\u0000${target.namespace ?? ''}\u0000${target.stripNamespace ? '1' : '0'}\u0000${target.blockedReason ?? ''}`;
       const group = groups.get(identity) ?? { target, findings: [] };
       group.findings.push(finding);
       groups.set(identity, group);
@@ -336,15 +353,122 @@ export class Extractor {
         stripNamespace: false
       });
     }
-    throw new Error(
-      `Findings span ${plans.length} catalog targets. Use planCatalogs() for split-catalog projects.`
+    throw new Error(`Findings span ${plans.length} catalog targets. Use planCatalogs() for split-catalog projects.`);
+  }
+
+  private sourceValueForKey(key: string, plans: CatalogPlan[]): string | undefined {
+    const sourceTarget = this.resolveTargetForKey(key, this.config.i18n.sourceLocale);
+    if (sourceTarget.blockedReason) return undefined;
+    const plan = plans.find(candidate =>
+      candidate.catalogPath === sourceTarget.catalogPath &&
+      candidate.namespace === sourceTarget.namespace &&
+      candidate.stripNamespace === sourceTarget.stripNamespace
     );
+    if (!plan) return undefined;
+    const physical = this.physicalKey(key, sourceTarget);
+    if (!physical) return undefined;
+    return this.parseCatalogContent(plan.outputContent, plan.catalogPath)[physical];
+  }
+
+  public validateRequiredLocales(plans: CatalogPlan[]): LocaleParityIssue[] {
+    const issues: LocaleParityIssue[] = [];
+    const sourceLocale = this.config.i18n.sourceLocale;
+    const requiredLocales = this.config.i18n.requiredLocales.filter(locale => locale !== sourceLocale);
+    if (requiredLocales.length === 0) return issues;
+
+    const keys = new Map<string, string | undefined>();
+    for (const plan of plans) {
+      for (const [findingId, key] of Object.entries(plan.keyByFindingId)) keys.set(key, findingId);
+    }
+
+    for (const [key, findingId] of keys) {
+      const sourceValue = this.sourceValueForKey(key, plans);
+      for (const locale of requiredLocales) {
+        const target = this.resolveTargetForKey(key, locale);
+        if (target.blockedReason) {
+          issues.push({
+            findingId,
+            key,
+            locale,
+            catalogPath: target.catalogPath,
+            kind: 'unroutable',
+            reason: target.blockedReason
+          });
+          continue;
+        }
+        const physical = this.physicalKey(key, target);
+        if (!physical) {
+          issues.push({
+            findingId,
+            key,
+            locale,
+            catalogPath: target.catalogPath,
+            kind: 'unroutable',
+            reason: `Catalog route '${target.namespace ?? 'default'}' cannot map key '${key}'`
+          });
+          continue;
+        }
+        const targetValue = this.readCatalog(target.catalogPath)[physical];
+        if (targetValue === undefined) {
+          issues.push({
+            findingId,
+            key,
+            locale,
+            catalogPath: target.catalogPath,
+            kind: 'missing-key',
+            reason: `Required locale '${locale}' does not contain '${key}'`
+          });
+          continue;
+        }
+        if (sourceValue !== undefined && !sameSet(placeholderNames(sourceValue), placeholderNames(targetValue))) {
+          issues.push({
+            findingId,
+            key,
+            locale,
+            catalogPath: target.catalogPath,
+            kind: 'placeholder-mismatch',
+            reason: `Interpolation placeholders for '${key}' differ between '${sourceLocale}' and '${locale}'`
+          });
+        }
+      }
+    }
+    return issues;
+  }
+
+  public enrichTranslationFindings(findings: Finding[], locale = this.config.i18n.sourceLocale): void {
+    for (const finding of findings) {
+      const key = finding.resolvedTranslationKey;
+      if (!key || finding.fallbackValue === undefined) continue;
+      const target = this.resolveTargetForKey(key, locale);
+      if (target.blockedReason) {
+        finding.catalogStatus = 'missing';
+        finding.catalogStatusReason = target.blockedReason;
+        continue;
+      }
+      const physical = this.physicalKey(key, target);
+      if (!physical) {
+        finding.catalogStatus = 'missing';
+        finding.catalogStatusReason = `Catalog route '${target.namespace ?? 'default'}' cannot map '${key}'`;
+        continue;
+      }
+      const catalogValue = this.readCatalog(target.catalogPath)[physical];
+      if (catalogValue === undefined) {
+        finding.catalogStatus = 'missing';
+        finding.catalogStatusReason = `Source catalog does not contain '${key}'`;
+      } else if (catalogValue !== finding.fallbackValue) {
+        finding.catalogStatus = 'source-mismatch';
+        finding.catalogStatusReason = `Fallback differs from the configured source-catalog value for '${key}'`;
+      } else {
+        finding.catalogStatus = 'present';
+        finding.catalogStatusReason = `Fallback matches the configured source-catalog value for '${key}'`;
+      }
+    }
   }
 
   public writePlans(plans: CatalogPlan[]): void {
     for (const plan of plans) {
-      if (plan.report.keyCollisions.length > 0) {
-        throw new Error(`Catalog plan for ${plan.catalogPath} contains key collisions and cannot be written`);
+      if (plan.report.keyCollisions.length > 0 || plan.report.blockedFindings.length > 0) {
+        throw new Error(`Catalog plan for ${plan.catalogPath} contains blocked or conflicting findings and cannot be written`);
       }
       if (plan.locale !== this.config.i18n.sourceLocale && plan.report.newEntries.length > 0) {
         throw new Error(
@@ -353,9 +477,7 @@ export class Extractor {
       }
     }
     writeFilesAtomically(
-      plans
-        .filter(plan => plan.changed)
-        .map(plan => ({ filePath: plan.catalogPath, content: plan.outputContent }))
+      plans.filter(plan => plan.changed).map(plan => ({ filePath: plan.catalogPath, content: plan.outputContent }))
     );
   }
 

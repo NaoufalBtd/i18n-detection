@@ -9,6 +9,7 @@ function ruleId(kind: FindingKind): string {
     JSXAttribute: 'i18n/jsx-attribute',
     KnownComponentProp: 'i18n/component-prop',
     KnownFunctionArgument: 'i18n/function-argument',
+    StateMessage: 'i18n/state-message',
     LocalConstUsedInUserFacingContext: 'i18n/local-constant',
     LocalObjectPropertyUsedInUserFacingContext: 'i18n/local-object-property',
     ConditionalStringUsedInUserFacingContext: 'i18n/conditional-string',
@@ -17,6 +18,8 @@ function ruleId(kind: FindingKind): string {
     TranslationFallback: 'i18n/translation-fallback',
     TranslationDefaultValue: 'i18n/translation-default-value',
     PresentationObjectString: 'i18n/presentation-object-string',
+    StaticUiRegistryString: 'i18n/static-ui-registry',
+    SchemaDefaultString: 'i18n/schema-default',
     InlineLocaleCatalogString: 'i18n/inline-locale-catalog',
     ValidationMessage: 'i18n/validation-message',
     NextMetadataString: 'i18n/next-metadata-string',
@@ -24,6 +27,10 @@ function ruleId(kind: FindingKind): string {
     AmbiguousString: 'i18n/ambiguous-string'
   };
   return byKind[kind];
+}
+
+function effectiveRule(finding: Finding): string {
+  return finding.rule ?? ruleId(finding.kind);
 }
 
 function codeFence(content: string, language: string): string {
@@ -70,11 +77,19 @@ export class Reporter {
         for (const finding of fileFindings) {
           markdown += `#### Line ${finding.line}\n\n`;
           markdown += `${codeFence(finding.rawText ?? '', 'tsx')}\n\n`;
-          markdown += `- Rule: \`${ruleId(finding.kind)}\`\n`;
+          markdown += `- Rule: \`${effectiveRule(finding)}\`\n`;
+          markdown += `- Kind: \`${finding.kind}\`\n`;
+          if (finding.expressionKind) markdown += `- Expression: \`${finding.expressionKind}\`\n`;
           markdown += `- Confidence: \`${finding.confidence}\`\n`;
           markdown += `- Fixability: \`${finding.fixability}\`\n`;
           markdown += `- Reason: ${finding.reason}\n`;
           if (finding.suggestedKey) markdown += `- Suggested key: \`${finding.suggestedKey}\`\n`;
+          if (finding.resolvedTranslationKey) markdown += `- Referenced translation key: \`${finding.resolvedTranslationKey}\`\n`;
+          if (finding.catalogStatus) {
+            markdown += `- Source catalog status: \`${finding.catalogStatus}\``;
+            if (finding.catalogStatusReason) markdown += ` — ${finding.catalogStatusReason}`;
+            markdown += '\n';
+          }
           markdown += '\n';
         }
       }
@@ -85,7 +100,7 @@ export class Reporter {
 
   public toSARIF(): string {
     const active = this.report.findings.filter(finding => finding.confidence !== 'ignored');
-    const rules = [...new Set(active.map(finding => ruleId(finding.kind)))].sort().map(id => ({
+    const rules = [...new Set(active.map(effectiveRule))].sort().map(id => ({
       id,
       shortDescription: { text: 'Hardcoded or embedded user-facing source string' },
       fullDescription: { text: 'User-facing source copy should follow the configured i18n policy and catalog architecture.' },
@@ -93,7 +108,7 @@ export class Reporter {
     }));
 
     const results = active.map(finding => ({
-      ruleId: ruleId(finding.kind),
+      ruleId: effectiveRule(finding),
       level: finding.confidence === 'high' ? 'error' : finding.confidence === 'medium' ? 'warning' : 'note',
       message: {
         text: `[i18n-scan] ${finding.reason}. Suggested key: ${finding.suggestedKey ?? 'n/a'}. Fixability: ${finding.fixability}.`
@@ -104,8 +119,14 @@ export class Reporter {
       properties: {
         confidence: finding.confidence,
         kind: finding.kind,
+        semanticRule: finding.rule,
+        expressionKind: finding.expressionKind,
         fixability: finding.fixability,
-        suggestedKey: finding.suggestedKey
+        suggestedKey: finding.suggestedKey,
+        translationNamespace: finding.translationNamespace,
+        referencedTranslationKey: finding.referencedTranslationKey,
+        resolvedTranslationKey: finding.resolvedTranslationKey,
+        catalogStatus: finding.catalogStatus
       },
       locations: [
         {
