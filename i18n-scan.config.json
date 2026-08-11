@@ -1,13 +1,13 @@
 {
   "include": [
-    "src/**/*.{ts,tsx}"
+    "src/**/*.{js,jsx,ts,tsx}",
+    "apps/*/src/**/*.{js,jsx,ts,tsx}",
+    "packages/*/src/**/*.{js,jsx,ts,tsx}"
   ],
   "exclude": [
-    "**/*.test.ts",
-    "**/*.test.tsx",
-    "**/*.spec.ts",
-    "**/*.spec.tsx",
-    "**/*.stories.tsx",
+    "**/*.test.{js,jsx,ts,tsx}",
+    "**/*.spec.{js,jsx,ts,tsx}",
+    "**/*.stories.{js,jsx,ts,tsx}",
     "**/__tests__/**",
     "**/mocks/**",
     "**/fixtures/**",
@@ -18,10 +18,13 @@
   "i18n": {
     "library": "next-intl",
     "sourceLocale": "en",
+    "requiredLocales": ["en"],
     "translationFunctionName": "t",
     "clientHook": "useTranslations",
     "serverAsyncFunction": "getTranslations",
     "messagesPath": "messages/{locale}.json",
+    "catalogRoutes": [],
+    "catalogRouting": "fallback",
     "catalogFormat": "nested-json",
     "keyStyle": "namespace.dot.camelCase"
   },
@@ -63,60 +66,22 @@
     "data-test"
   ],
   "checkedComponentProps": {
-    "PageHeader": [
-      "title",
-      "subtitle",
-      "description"
-    ],
-    "EmptyState": [
-      "title",
-      "description",
-      "actionLabel"
-    ],
-    "ConfirmDialog": [
-      "title",
-      "description",
-      "confirmLabel",
-      "cancelLabel"
-    ],
-    "Dialog": [
-      "title",
-      "description"
-    ],
-    "Button": [
-      "label",
-      "aria-label"
-    ],
-    "DataTable": [
-      "emptyText",
-      "loadingText"
-    ]
+    "PageHeader": ["title", "subtitle", "description"],
+    "EmptyState": ["title", "description", "actionLabel"],
+    "ConfirmDialog": ["title", "description", "confirmLabel", "cancelLabel"],
+    "Dialog": ["title", "description"],
+    "Button": ["label", "aria-label"],
+    "DataTable": ["emptyText", "loadingText"]
   },
   "checkedFunctions": {
-    "toast.success": [
-      0
-    ],
-    "toast.error": [
-      0
-    ],
-    "toast.info": [
-      0
-    ],
-    "toast.warning": [
-      0
-    ],
-    "notify": [
-      0
-    ],
-    "showToast": [
-      0
-    ],
-    "alert": [
-      0
-    ],
-    "confirm": [
-      0
-    ]
+    "toast.success": [0],
+    "toast.error": [0],
+    "toast.info": [0],
+    "toast.warning": [0],
+    "notify": [0],
+    "showToast": [0],
+    "alert": [0],
+    "confirm": [0]
   },
   "checkedObjectKeys": [
     "title",
@@ -150,12 +115,7 @@
     "event",
     "className"
   ],
-  "allowedStrings": [
-    "OK",
-    "ID",
-    "API",
-    "URL"
-  ],
+  "allowedStrings": ["OK", "ID", "API", "URL"],
   "commonMappings": {
     "Save": "common.actions.save",
     "Cancel": "common.actions.cancel",
@@ -167,19 +127,30 @@
     "No results": "common.empty.noResults"
   },
   "scanErrors": false,
-  "uiConfigVariables": [
-    "columns",
-    "tabs",
-    "steps",
-    "menuItems",
-    "navItems"
-  ],
-  "uiConfigTypes": [
-    "ColumnDef",
-    "TabItem",
-    "StepConfig",
-    "MenuItem"
-  ],
+  "uiConfigVariables": ["columns", "tabs", "steps", "menuItems", "navItems"],
+  "uiConfigTypes": ["ColumnDef", "TabItem", "StepConfig", "MenuItem"],
+  "semantic": {
+    "translationApis": [
+      { "callee": "t", "keyArgument": 0, "fallbackArgument": 1, "optionsArgument": 1, "defaultValueProperty": "defaultValue" },
+      { "callee": "translations.t", "keyArgument": 0, "fallbackArgument": 1 },
+      { "callee": "getTranslation", "keyArgument": 0, "fallbackArgument": 1 }
+    ],
+    "translationHooks": {},
+    "presentationFilePatterns": ["presentation", "presenter", "adapter", "view-model", "viewmodel", "translations", "columns"],
+    "presentationFunctionPatterns": ["^get.*Presentation$", "^adapt", "^map.*Presentation$", "^use.*Translations$", "^get.*Columns$"],
+    "presentationObjectKeys": ["title", "subtitle", "description", "label", "defaultLabel", "message", "helperText", "emptyText", "header", "footer", "caption", "tooltip", "placeholder", "actionLabel", "ctaLabel", "primary", "secondary"],
+    "translationObjectVariables": ["labels", "copy", "messages", "translations"],
+    "presentationInclude": ["src/", "apps/web/"],
+    "staticRegistryVariablePatterns": ["(_OPTIONS|_STATES|_DEFINITIONS|_COPY|_LABELS)$", "^(OPTIONS|STATES|DEFINITIONS|COPY|LABELS)$"],
+    "staticRegistryObjectKeys": ["title", "subtitle", "description", "label", "defaultLabel", "message", "helperText", "emptyText", "caption", "tooltip", "placeholder", "actionLabel", "ctaLabel"],
+    "staticRegistryInclude": ["src/", "apps/web/", "packages/contracts/"],
+    "inlineLocaleKeys": ["en", "fr", "ar"],
+    "validationInclude": ["src/", "apps/web/", "packages/contracts/"],
+    "schemaDefaultKeys": ["title", "subtitle", "description", "label", "defaultLabel", "message", "helperText", "emptyText", "caption", "tooltip", "placeholder", "actionLabel", "ctaLabel", "guidedPrompt", "reassurance", "eyebrow", "body"],
+    "scanSchemaDefaults": true,
+    "scanValidationMessages": true,
+    "scanNextMetadata": true
+  },
   "features": {
     "sameFileConstants": true,
     "sameFileObjects": true,
@@ -192,6 +163,7 @@
     "insertServerTranslations": true
   },
   "codemod": {
-    "framework": "next-intl"
+    "framework": "next-intl",
+    "requireProjectValidation": false
   }
 }
